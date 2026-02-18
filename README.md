@@ -1,18 +1,25 @@
 # Transcripts MCP Server
 
-A remote **Model Context Protocol (MCP)** server hosted on **Azure Container Apps** that retrieves Microsoft Teams meeting transcripts via Microsoft Graph API using delegated **OAuth 2.0 On-Behalf-Of (OBO)** authentication.
+A remote **Model Context Protocol (MCP)** server that retrieves Microsoft Teams meeting transcripts via the Microsoft Graph API, using delegated **OAuth 2.0 On-Behalf-Of (OBO)** authentication.
 
-Designed for integration with **Microsoft Copilot Studio** via the MCP Wizard.
-
-> **Build time**: This entire project — code, Docker image, Azure deployment (Container Registry, Container Apps, App Registration with OBO), Copilot Studio integration, and iterative Graph API debugging — was built and deployed in approximately **90 minutes**.
+Hosted on **Azure Container Apps** and designed for integration with **Microsoft Copilot Studio** (via the MCP Wizard), though any MCP-compatible client can connect.
 
 ---
 
 ## Table of Contents
 
+- [Features](#features)
 - [Architecture](#architecture)
+- [How It Works — Internals](#how-it-works--internals)
+  - [End-to-End Pipeline](#end-to-end-pipeline)
+  - [Meeting Discovery (Calendar API)](#meeting-discovery-calendar-api)
+  - [Meeting Resolution (OnlineMeetings API)](#meeting-resolution-onlinemeetings-api)
+  - [Transcript Download & Cleaning](#transcript-download--cleaning)
+  - [MCP Transport](#mcp-transport)
+  - [Authentication Chain](#authentication-chain)
 - [Tools](#tools)
 - [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
 - [Azure App Registration Setup](#azure-app-registration-setup)
 - [Environment Variables](#environment-variables)
 - [Local Development](#local-development)
@@ -23,7 +30,21 @@ Designed for integration with **Microsoft Copilot Studio** via the MCP Wizard.
 - [Project Structure](#project-structure)
 - [Permissions Deep Dive](#permissions-deep-dive)
 - [Troubleshooting](#troubleshooting)
+- [Development History](#development-history)
 - [License](#license)
+
+---
+
+## Features
+
+- **Two MCP tools**: List meetings with transcript availability, retrieve and clean full transcripts
+- **Delegated-only permissions**: The server never has its own access — every Graph call runs in the signed-in user's context via OBO
+- **Calendar-based discovery**: Uses `/me/calendarView` to find meetings, then resolves each to an online meeting ID — works around severe `/me/onlineMeetings` API limitations
+- **Optimised name search**: Filters calendar events by subject *before* resolving to online meetings (avoids unnecessary API calls)
+- **VTT cleaning**: Strips all WebVTT metadata (timestamps, cue IDs, NOTE blocks, HTML tags) and merges consecutive same-speaker lines into readable paragraphs
+- **Comprehensive logging**: All Graph API calls are traced with `[graph]` prefixes for debugging
+- **Stateless container**: Scales to zero when idle, ~250ms cold start on Alpine Node.js 20
+- **Built for Copilot Studio**: Drop-in MCP server with OAuth 2.0 wizard support
 
 ---
 
@@ -32,23 +53,24 @@ Designed for integration with **Microsoft Copilot Studio** via the MCP Wizard.
 ```
 ┌──────────────────┐     HTTPS + Bearer Token     ┌─────────────────────────┐
 │                  │ ──────────────────────────►   │  Azure Container Apps   │
-│  Copilot Studio  │                               │  (transcripts-mcp-     │
-│  (MCP Client)    │  ◄──────────────────────────  │   server)              │
-│                  │     JSON-RPC (MCP Protocol)   │                        │
-└──────────────────┘                               └────────────┬───────────┘
+│  Copilot Studio  │                               │  (MCP Server)           │
+│  (MCP Client)    │  ◄──────────────────────────  │                         │
+│                  │     JSON-RPC (MCP Protocol)   │  Express + Streamable   │
+└──────────────────┘                               │  HTTP Transport         │
+                                                   └────────────┬────────────┘
                                                                 │
                                                     OBO Token   │  Graph Token
                                                     Exchange    │
                                                                 ▼
-                                                   ┌────────────────────────┐
-                                                   │  Microsoft Graph API   │
-                                                   │                        │
-                                                   │  /me/calendarView      │
-                                                   │  /me/onlineMeetings    │
-                                                   │    ?$filter=JoinWebUrl │
-                                                   │  /{id}/transcripts     │
-                                                   │  /{tid}/content        │
-                                                   └────────────────────────┘
+                                                   ┌─────────────────────────┐
+                                                   │  Microsoft Graph API    │
+                                                   │                         │
+                                                   │  /me/calendarView       │
+                                                   │  /me/onlineMeetings     │
+                                                   │    ?$filter=JoinWebUrl  │
+                                                   │  /{id}/transcripts      │
+                                                   │  /{tid}/content         │
+                                                   └─────────────────────────┘
 ```
 
 ### Auth Flow
@@ -56,18 +78,188 @@ Designed for integration with **Microsoft Copilot Studio** via the MCP Wizard.
 ```
 User in Copilot Studio
   │
-  ├─1─► Sign in via OAuth 2.0 → receives access token scoped to api://<client-id>/access_as_user
+  ├─1─► Sign in via OAuth 2.0 → gets token scoped to api://<client-id>/access_as_user
   │
   ├─2─► Copilot sends MCP request with Authorization: Bearer <user-token>
   │
-  ├─3─► MCP Server extracts bearer token
+  ├─3─► MCP Server extracts bearer token from request header
   │
   ├─4─► MSAL OBO flow exchanges user token → Microsoft Graph token (delegated)
   │
-  └─5─► Graph API calls execute in user context (never app-level "god mode")
+  └─5─► Graph API calls execute as the signed-in user (never app-level)
 ```
 
 **Key design decision**: All Graph API permissions are **delegated** — the server only accesses meetings and transcripts the signed-in user has permission to see. There is no application-level access.
+
+---
+
+## How It Works — Internals
+
+This section explains the internal workings of the server for contributors and anyone wanting to understand the design decisions.
+
+### End-to-End Pipeline
+
+When a user asks "*Get the transcript for the Design Review meeting*", the following chain executes:
+
+```
+User prompt
+  │
+  ▼
+Copilot Studio (LLM) decides to call get_meeting_transcript(meetingName="Design Review")
+  │
+  ▼
+MCP JSON-RPC POST to /mcp with Bearer token
+  │
+  ▼
+┌─ server.ts ──────────────────────────────────────────────────────────────────┐
+│  1. Extract bearer token from Authorization header                          │
+│  2. MSAL OBO exchange → Microsoft Graph delegated token                     │
+│  3. Create stateless MCP Server instance, wire tool handlers                │
+│  4. Route to handleGetMeetingTranscript()                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─ graph.ts ───────────────────────────────────────────────────────────────────┐
+│  findMeetingsByName("Design Review")                                        │
+│                                                                             │
+│  5. GET /me/calendarView?startDateTime=...&endDateTime=...                  │
+│     → Returns all calendar events in the date range (30 days back,          │
+│       7 days forward by default)                                            │
+│                                                                             │
+│  6. Filter by subject name first (case-insensitive partial match)           │
+│     → "Design Review" matches "Weekly Design Review" ✓                      │
+│                                                                             │
+│  7. Filter for events with a Teams join URL (onlineMeeting.joinUrl)         │
+│                                                                             │
+│  8. For ONLY matching events, resolve via:                                  │
+│     GET /me/onlineMeetings?$filter=JoinWebUrl eq '<joinUrl>'                │
+│     → Returns the onlineMeeting object with the meeting ID                  │
+│     → Falls back to decoded URL if exact match fails                        │
+│                                                                             │
+│  9. GET /me/onlineMeetings/{meetingId}/transcripts                          │
+│     → List available transcripts                                            │
+│                                                                             │
+│ 10. GET /me/onlineMeetings/{meetingId}/transcripts/{tid}/content?$format=   │
+│     text/vtt → Download the raw WebVTT transcript                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+  │
+  ▼
+┌─ vtt-parser.ts ──────────────────────────────────────────────────────────────┐
+│ 11. Strip WEBVTT header, timestamps, cue IDs, NOTE blocks, HTML tags        │
+│ 12. Convert <v Speaker Name>text</v> → "Speaker Name: text"                │
+│ 13. Merge consecutive same-speaker lines into paragraphs                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+  │
+  ▼
+Return to Copilot Studio as plain-text speaker-attributed dialogue:
+
+  Meeting: Weekly Design Review
+  Date: 2026-02-18T15:00:00Z
+  ---
+
+  Alice Smith: We need to finalise the mockups by Friday.
+  Bob Jones: I've updated the Figma file. The navigation flow is ready for review.
+  Alice Smith: Great, let's walk through it now...
+```
+
+This is 5 separate Graph API calls per transcript retrieval (calendarView → onlineMeetings → transcripts → content), but by filtering by name *before* resolving meetings, the server avoids unnecessary API calls for events the user didn't ask about.
+
+### Meeting Discovery (Calendar API)
+
+The server uses `/me/calendarView` instead of `/me/onlineMeetings` for meeting discovery. This was a deliberate architectural decision driven by **severe undocumented limitations** in the `/me/onlineMeetings` endpoint:
+
+| What you'd expect to work | What actually happens |
+|---------------------------|----------------------|
+| `GET /me/onlineMeetings` (list all) | **400** — endpoint requires `$filter` |
+| `$filter=startDateTime ge 2026-02-01` | **400** — `startDateTime` is not a filterable property |
+| `$top=10&$orderby=startDateTime desc` | **400** — `$top` and `$orderby` not supported |
+| `$filter=isOnlineMeeting eq true` on calendarView | **400** — `isOnlineMeeting` not filterable |
+
+**The only supported filter** on `/me/onlineMeetings` is `JoinWebUrl eq '...'` — which requires you to already know the join URL.
+
+**Solution**: Use the Calendar API (`/me/calendarView`) which supports date ranges natively, include `onlineMeeting` in `$select`, then filter client-side for events with a join URL. Resolve each join URL via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` to get the meeting ID needed for transcript access.
+
+### Meeting Resolution (OnlineMeetings API)
+
+Each calendar event with a Teams join URL must be resolved to an `onlineMeeting` object. This is handled by `resolveOnlineMeeting()`:
+
+1. **Try exact match**: `$filter=JoinWebUrl eq '<joinUrl>'`
+2. **Try decoded URL**: Some Graph tenants store the decoded form — `decodeURIComponent(joinUrl)` is tried if the exact match fails
+3. **Non-throwing**: Resolution failures are logged (`[graph] GET failed:`) rather than silently swallowed, so cross-tenant meetings (403) or network issues are visible in container logs
+
+**Cross-tenant meetings**: If the user's calendar contains meetings organised in a different Entra ID tenant, the `/me/onlineMeetings` endpoint returns 403. This is expected — the meeting object belongs to the organiser's tenant. The server logs these and continues to the next event.
+
+### Transcript Download & Cleaning
+
+Raw Teams transcripts are in WebVTT format and contain significant metadata:
+
+```vtt
+WEBVTT
+
+617c22e3-ccc5-445a-b806-be21f6abb3be
+00:00:00.000 --> 00:00:05.840
+<v Graham Hosking>We need to discuss the Q4 roadmap.</v>
+
+617c22e3-ccc5-445a-b806-be21f6abb3be
+00:00:05.840 --> 00:00:08.120
+<v Graham Hosking>First item is the timeline.</v>
+
+a1b2c3d4-e5f6-7890-abcd-ef1234567890
+00:00:08.120 --> 00:00:12.000
+<v Sarah Chen>I've prepared the Gantt chart.</v>
+```
+
+The `cleanVttTranscript()` function in `vtt-parser.ts`:
+
+1. **Strips**: WEBVTT header, all timestamp lines (`00:00:00.000 --> ...`), cue IDs (numeric and UUID), NOTE blocks, `<v>` and `</v>` HTML voice tags (converting to `Speaker: text` format), any remaining HTML tags
+2. **Merges**: Consecutive lines from the same speaker into single paragraphs
+
+Output:
+```
+Graham Hosking: We need to discuss the Q4 roadmap. First item is the timeline.
+Sarah Chen: I've prepared the Gantt chart.
+```
+
+### MCP Transport
+
+The server uses **Streamable HTTP** transport in **stateless mode**:
+
+- **One `Server` instance per request**: A fresh MCP `Server` is created for every incoming `POST /mcp`, wired with the user's Graph token, and disposed after the response. No sessions are maintained.
+- **`sessionIdGenerator: undefined`**: Disables MCP session management — each request is independent.
+- **Why stateless**: Container Apps scales to zero when idle. Stateful sessions would break across cold starts and replica restarts. Copilot Studio sends every tool call as an independent HTTP request with its own bearer token, so session state is unnecessary.
+
+> **Implementation note**: The server uses the low-level `Server` class from `@modelcontextprotocol/sdk`, not the higher-level `McpServer` class. This avoids a TypeScript `TS2589` (deep type instantiation) error triggered by Zod's optional schemas in the SDK's type inference. The low-level API works identically but requires manual `setRequestHandler()` wiring.
+
+### Authentication Chain
+
+```
+Copilot Studio user signs in
+  │
+  ▼ (OAuth 2.0 Authorization Code flow)
+Entra ID issues token scoped to: api://<client-id>/access_as_user
+  │
+  ▼ (Copilot Studio sends to MCP server)
+server.ts extracts Bearer token from Authorization header
+  │
+  ▼
+auth.ts: MSAL ConfidentialClientApplication.acquireTokenOnBehalfOf()
+  │
+  ▼ (OBO flow — exchanges user token for Graph token)
+Entra ID issues delegated Graph token with scopes:
+  - User.Read
+  - Calendars.Read
+  - OnlineMeetings.Read
+  - OnlineMeetingTranscript.Read.All
+  │
+  ▼
+graph.ts uses delegated token for all API calls → runs as the signed-in user
+```
+
+**Security properties**:
+- The server's client secret authenticates the app to Entra ID, but the *access* is always the user's
+- If a user doesn't have access to a meeting or transcript, Graph will deny the request
+- Tokens are never stored — each request does a fresh OBO exchange
+- No application-level permissions are used
 
 ---
 
@@ -93,19 +285,7 @@ Retrieves and cleans the transcript for a specific Teams meeting.
 | `meetingName` | string | Yes | Meeting subject to search for (partial match, case-insensitive) |
 | `meetingDate` | string | No | Date filter (YYYY-MM-DD) to narrow results |
 
-**Returns**: Clean speaker-attributed text with all VTT metadata stripped. The output is ready for AI summarisation and analysis.
-
-**Multi-hop process** (optimised in v9):
-1. Queries `/me/calendarView` to find Teams calendar events in the date range (30 days back to 7 days forward by default)
-2. Filters client-side by **subject name first** (case-insensitive partial match) — before any expensive API calls
-3. Filters for events with a Teams join URL (`onlineMeeting.joinUrl`)
-4. Resolves only matching join URLs to an `onlineMeeting` ID via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` (with decoded URL fallback)
-5. Lists transcripts via `/me/onlineMeetings/{id}/transcripts`
-6. Downloads raw VTT from `/me/onlineMeetings/{id}/transcripts/{tid}/content`
-7. Strips WEBVTT headers, timestamps, cue IDs, NOTE blocks, HTML tags
-8. Merges consecutive same-speaker lines into paragraphs
-
-> **Logging**: All Graph API calls are traced to container logs (`[graph]` prefix) for debugging. Failed meeting resolutions are logged with the join URL and error details rather than silently swallowed.
+**Returns**: Clean speaker-attributed text with all VTT metadata stripped. The output is ready for AI summarisation, action item extraction, or semantic search.
 
 ---
 
@@ -113,11 +293,38 @@ Retrieves and cleans the transcript for a specific Teams meeting.
 
 - **Azure Subscription** with Container Apps support
 - **Azure Container Registry** (Basic SKU is sufficient)
-- **Microsoft Entra ID (Azure AD)** — ability to create App Registrations and grant admin consent
+- **Microsoft Entra ID** — ability to create App Registrations and grant admin consent
 - **Node.js** ≥ 20 (for local development only)
 - **Docker** (optional — ACR can build images remotely via `az acr build`)
 - **Azure CLI** (`az`) installed and logged in
 - A **Microsoft 365 licence** with Teams meetings and transcription enabled
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone and install
+git clone https://github.com/<your-org>/TranscriptsMCP.git
+cd TranscriptsMCP
+npm install
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env with your Azure App Registration credentials:
+#   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID
+
+# 3. Build and run
+npm run build
+npm start
+# → Server running on http://localhost:8080
+
+# 4. Health check
+curl http://localhost:8080/health
+# → {"status":"ok","service":"transcripts-mcp-server"}
+```
+
+For production deployment to Azure, see [Deploy to Azure Container Apps](#deploy-to-azure-container-apps).
 
 ---
 
@@ -129,7 +336,7 @@ Retrieves and cleans the transcript for a specific Teams meeting.
 2. Click **New registration**
    - **Name**: `Transcripts MCP Server`
    - **Supported account types**: Single tenant (your org only)
-   - **Redirect URI**: Leave blank (added in step 6)
+   - **Redirect URI**: Leave blank (added in step 5)
 3. Note the **Application (client) ID** and **Directory (tenant) ID**
 
 ### 2. Create a Client Secret
@@ -168,7 +375,7 @@ This is the **critical step** that enables the On-Behalf-Of flow. Without it, th
 
 3. Click **Grant admin consent for [your tenant]**
 
-> **Important**: After granting admin consent, verify the consent grant includes **all four scopes**. If the grant was created before all permissions were added, you may need to update it. See [Troubleshooting → AADSTS65001](#troubleshooting).
+> **Important**: After granting admin consent, verify the consent grant includes **all four scopes**. If the grant was created before all permissions were added, you may need to update it. See [Troubleshooting → Verifying Admin Consent Grants](#verifying-admin-consent-grants).
 
 ### 5. Configure Authentication (Redirect URIs)
 
@@ -185,11 +392,11 @@ This is the **critical step** that enables the On-Behalf-Of flow. Without it, th
 
 > **Note**: The third URI is specific to your Copilot Studio connector. When you set up the MCP connection in Copilot Studio, it will display the exact redirect URI you need to register. You **must** add it or you will get `AADSTS500113`.
 
-### 6. Authorize Client Applications (Optional)
+### 6. Authorise Client Applications (Optional)
 
 If Copilot Studio provides a client application ID:
 
-1. Go to **Expose an API** → **Authorized client applications**
+1. Go to **Expose an API** → **Authorised client applications**
 2. Add the Copilot Studio client application ID
 3. Check the `access_as_user` scope
 
@@ -210,7 +417,7 @@ If Copilot Studio provides a client application ID:
 
 ```bash
 # Clone and install
-git clone <repo-url>
+git clone https://github.com/<your-org>/TranscriptsMCP.git
 cd TranscriptsMCP
 npm install
 
@@ -257,46 +464,14 @@ docker run -p 8080:8080 \
   transcripts-mcp-server
 ```
 
-The Dockerfile uses a **multi-stage build** (node:20-alpine) with a non-root user for security.
+The Dockerfile uses a **multi-stage build** (node:20-alpine) with a non-root user for security:
+
+1. **Builder stage**: Installs all dependencies, compiles TypeScript
+2. **Production stage**: Copies only compiled JS + production dependencies, runs as `mcpuser` (non-root)
 
 ---
 
 ## Deploy to Azure Container Apps
-
-### Current Deployment
-
-| Resource | Name | Location |
-|----------|------|----------|
-| Subscription | `VS Sub No2` (`bfec7165-22d1-4917-89e7-efda8a9e85b4`) | — |
-| Resource Group | `rg-transcripts-mcp` | UK South |
-| Container Registry | `transcriptsmcpacr` (`transcriptsmcpacr.azurecr.io`) | UK South |
-| Container Apps Environment | `cae-transcripts-mcp` | UK South |
-| Container App | `transcripts-mcp-server` | UK South |
-| App Registration | `Transcripts MCP Server` (`197e344d-14d6-49ea-accd-4725a1cb8230`) | — |
-
-**Live Endpoints**:
-- Health: `https://transcripts-mcp-server.gentleocean-42ff35ee.uksouth.azurecontainerapps.io/health`
-- MCP: `https://transcripts-mcp-server.gentleocean-42ff35ee.uksouth.azurecontainerapps.io/mcp`
-
-**Container config**: 0.25 vCPU, 0.5 GiB memory, scales to zero when idle, max 1 replica.
-
-### Redeploy After Code Changes
-
-```bash
-# 1. Rebuild image in ACR (cloud build — no local Docker needed)
-az acr build --registry transcriptsmcpacr \
-  --image transcripts-mcp-server:latest \
-  --file Dockerfile .
-
-# 2. Update the container app to pull the new image
-az containerapp update \
-  --resource-group rg-transcripts-mcp \
-  --name transcripts-mcp-server \
-  --image transcriptsmcpacr.azurecr.io/transcripts-mcp-server:latest
-
-# 3. Verify
-curl https://transcripts-mcp-server.gentleocean-42ff35ee.uksouth.azurecontainerapps.io/health
-```
 
 ### Deploy from Scratch
 
@@ -306,33 +481,34 @@ az login
 az account set --subscription <subscription-id>
 
 # 2. Create resource group
-az group create --name rg-transcripts-mcp --location uksouth
+az group create --name rg-transcripts-mcp --location <region>
 
 # 3. Create Azure Container Registry
 az acr create --resource-group rg-transcripts-mcp \
-  --name transcriptsmcpacr --sku Basic --admin-enabled true --location uksouth
+  --name <your-acr-name> --sku Basic --admin-enabled true --location <region>
 
 # 4. Build image in ACR (no local Docker needed)
-az acr build --registry transcriptsmcpacr \
+az acr build --registry <your-acr-name> \
   --image transcripts-mcp-server:latest --file Dockerfile .
 
 # 5. Create Container Apps Environment
 az containerapp env create \
   --resource-group rg-transcripts-mcp \
   --name cae-transcripts-mcp \
-  --location uksouth
+  --location <region>
 
 # 6. Get ACR credentials
-ACR_PWD=$(az acr credential show --name transcriptsmcpacr --query 'passwords[0].value' -o tsv)
+ACR_PWD=$(az acr credential show --name <your-acr-name> \
+  --query 'passwords[0].value' -o tsv)
 
 # 7. Create Container App
 az containerapp create \
   --resource-group rg-transcripts-mcp \
   --name transcripts-mcp-server \
   --environment cae-transcripts-mcp \
-  --image transcriptsmcpacr.azurecr.io/transcripts-mcp-server:latest \
-  --registry-server transcriptsmcpacr.azurecr.io \
-  --registry-username transcriptsmcpacr \
+  --image <your-acr-name>.azurecr.io/transcripts-mcp-server:latest \
+  --registry-server <your-acr-name>.azurecr.io \
+  --registry-username <your-acr-name> \
   --registry-password "$ACR_PWD" \
   --target-port 8080 \
   --ingress external \
@@ -344,7 +520,31 @@ az containerapp create \
     AZURE_TENANT_ID=<tenant-id> \
     PORT=8080
 
-# 8. Verify
+# 8. Get the FQDN
+az containerapp show \
+  --resource-group rg-transcripts-mcp \
+  --name transcripts-mcp-server \
+  --query 'properties.configuration.ingress.fqdn' -o tsv
+
+# 9. Verify
+curl https://<your-app-fqdn>/health
+```
+
+### Redeploy After Code Changes
+
+```bash
+# 1. Rebuild image in ACR
+az acr build --registry <your-acr-name> \
+  --image transcripts-mcp-server:<version-tag> \
+  --file Dockerfile .
+
+# 2. Update the container app
+az containerapp update \
+  --resource-group rg-transcripts-mcp \
+  --name transcripts-mcp-server \
+  --image <your-acr-name>.azurecr.io/transcripts-mcp-server:<version-tag>
+
+# 3. Verify
 curl https://<your-app-fqdn>/health
 ```
 
@@ -355,6 +555,17 @@ az containerapp logs show \
   --resource-group rg-transcripts-mcp \
   --name transcripts-mcp-server \
   --type console --tail 50
+```
+
+All Graph API operations are logged with `[graph]` prefixes, making it straightforward to trace the pipeline:
+
+```
+[graph] calendarView request: 2026-01-19T06:35:38Z → 2026-02-25T06:35:38Z
+[graph] calendarView returned 8 events
+[graph] 4 of 8 events have a Teams join URL
+[graph] Resolved 3 online meetings
+[graph] findMeetingsByName("Design Review"): 1 name matches out of 8 events
+[graph] findMeetingsByName resolved 1 meetings
 ```
 
 ### Update Environment Variables
@@ -375,21 +586,21 @@ az containerapp update \
 1. In Copilot Studio, open your agent → **Tools** → **Add a tool**
 2. Select **MCP Server**
 3. Enter the MCP server URL:
-   - **URL**: `https://transcripts-mcp-server.gentleocean-42ff35ee.uksouth.azurecontainerapps.io/mcp`
+   - **URL**: `https://<your-app-fqdn>/mcp`
 4. Select **Authentication**: OAuth 2.0
 5. Fill in the OAuth 2.0 settings:
 
    | Field | Value |
    |-------|-------|
-   | **Client ID** | `197e344d-14d6-49ea-accd-4725a1cb8230` |
-   | **Client Secret** | *(retrieve from App Registration → Certificates & secrets)* |
-   | **Authorization URL** | `https://login.microsoftonline.com/b5c09a39-9df6-437a-a76e-19095fa6f20d/oauth2/v2.0/authorize` |
-   | **Token URL** | `https://login.microsoftonline.com/b5c09a39-9df6-437a-a76e-19095fa6f20d/oauth2/v2.0/token` |
-   | **Refresh URL** | `https://login.microsoftonline.com/b5c09a39-9df6-437a-a76e-19095fa6f20d/oauth2/v2.0/token` *(same as Token URL)* |
-   | **Scope** | `api://197e344d-14d6-49ea-accd-4725a1cb8230/access_as_user` |
+   | **Client ID** | Your Application (client) ID |
+   | **Client Secret** | Your client secret value |
+   | **Authorization URL** | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/authorize` |
+   | **Token URL** | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` |
+   | **Refresh URL** | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` *(same as Token URL)* |
+   | **Scope** | `api://<client-id>/access_as_user` |
 
 6. **Copy the redirect URI** shown by the wizard (e.g., `https://global.consent.azure-apim.net/redirect/...`)
-7. **Register the redirect URI** in the App Registration (see [Step 5: Configure Authentication](#5-configure-authentication-redirect-uris))
+7. **Register the redirect URI** in the App Registration (see [Step 5](#5-configure-authentication-redirect-uris))
 8. Test the connection — you should see both tools discovered:
    - `list_recent_meetings`
    - `get_meeting_transcript`
@@ -398,11 +609,31 @@ az containerapp update \
 
 Once connected, users can ask the Copilot:
 
+- *"What meetings do I have today?"*
 - *"Show me my recent meetings"*
-- *"What meetings did I have on 2026-02-14?"*
-- *"Get the transcript from the Design Review meeting on Monday"*
+- *"Get the transcript from the Design Review meeting"*
 - *"What did Sarah say in yesterday's standup?"*
-- *"Summarize the transcript from the Q4 Planning session"*
+- *"Summarise the TredStone meeting from Tuesday"*
+
+### Example Output
+
+**User**: *"Get the transcript for the TredStone meeting"*
+
+**Copilot Studio** calls `get_meeting_transcript(meetingName="TredStone")`, which returns clean speaker-attributed text:
+
+```
+Meeting: TredStone - Meetings
+Date: 2026-02-18T19:00:00Z
+---
+
+Graham Hosking: on optimising our Microsoft solutions to address some key
+pain points and unlock new possibilities. We all know that navigating the
+vast landscape of Microsoft can be challenging, from licencing to integration.
+One significant pain point is ensuring seamless collaboration across different
+departments...
+```
+
+Copilot Studio then automatically summarises the raw transcript into structured insights, action items, and highlights for the user.
 
 ---
 
@@ -460,7 +691,7 @@ TranscriptsMCP/
 │   └── vtt-parser.ts    # WebVTT → clean text parser with speaker merge
 ├── dist/                # Compiled JavaScript output (generated by tsc)
 ├── Dockerfile           # Multi-stage Docker build (node:20-alpine, non-root)
-├── package.json         # Dependencies: @modelcontextprotocol/sdk, @azure/msal-node, express, zod
+├── package.json         # Dependencies and scripts
 ├── tsconfig.json        # TypeScript config: ES2022 target, CommonJS modules, strict
 ├── .env.example         # Template for environment variables
 ├── .gitignore           # Ignores node_modules, dist, .env, *.log
@@ -470,21 +701,21 @@ TranscriptsMCP/
 
 ### Module Details
 
-| Module | Purpose | Key exports |
-|--------|---------|-------------|
-| `server.ts` | Express HTTP server + MCP protocol wiring. Creates a new `Server` instance per request (stateless). Routes `tools/list` and `tools/call`. | Express app, listens on `PORT` |
-| `auth.ts` | MSAL OBO token exchange. Extracts bearer token from headers, exchanges for Graph API token. | `getGraphTokenOBO(userAssertion)`, `extractBearerToken(authHeader)` |
-| `graph.ts` | Microsoft Graph REST calls. Uses Calendar API (`/me/calendarView`) for meeting discovery, resolves join URLs to online meeting IDs, then fetches transcripts. | `listMeetings()`, `listTranscripts()`, `getTranscriptContent()`, `findMeetingsByName()` |
-| `vtt-parser.ts` | Strips VTT metadata (headers, timestamps, cue IDs, NOTEs, HTML tags). Merges consecutive same-speaker lines. | `cleanVttTranscript(rawVtt)` |
+| Module | Lines | Purpose | Key Exports |
+|--------|-------|---------|-------------|
+| `server.ts` | ~300 | Express HTTP server + MCP protocol wiring. Creates a new `Server` instance per request (stateless). Defines tool schemas and routes `tools/list` and `tools/call`. | Express app, `handleListRecentMeetings()`, `handleGetMeetingTranscript()` |
+| `auth.ts` | ~80 | MSAL OBO token exchange. Creates `ConfidentialClientApplication` at startup, exchanges incoming bearer tokens for delegated Graph API tokens. | `getGraphTokenOBO(userAssertion)`, `extractBearerToken(authHeader)` |
+| `graph.ts` | ~290 | Microsoft Graph REST client. Uses Calendar API for meeting discovery, resolves join URLs to online meeting IDs, fetches transcripts. Includes `graphGetSafe()` for non-throwing calls with logging. | `listMeetings()`, `findMeetingsByName()`, `listTranscripts()`, `getTranscriptContent()` |
+| `vtt-parser.ts` | ~130 | Strips VTT metadata (headers, timestamps, cue IDs, NOTEs, HTML tags). Converts `<v Speaker>text</v>` to `Speaker: text`. Merges consecutive same-speaker lines. | `cleanVttTranscript(rawVtt)` |
 
 ### Dependencies
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `@modelcontextprotocol/sdk` | 1.12.1 | MCP server and transport (Streamable HTTP) |
-| `@azure/msal-node` | 2.16.2 | MSAL ConfidentialClientApplication for OBO flow |
-| `express` | 4.21.2 | HTTP framework |
-| `zod` | 3.24.3 | Schema validation (MCP SDK dependency) |
+| `@modelcontextprotocol/sdk` | ^1.12.1 | MCP server and Streamable HTTP transport |
+| `@azure/msal-node` | ^2.16.2 | MSAL ConfidentialClientApplication for OBO flow |
+| `express` | ^4.21.2 | HTTP framework |
+| `zod` | ^3.24.2 | Schema validation (MCP SDK dependency) |
 
 ---
 
@@ -503,7 +734,7 @@ TranscriptsMCP/
 
 | Scope | URI | Purpose |
 |-------|-----|---------|
-| `access_as_user` | `api://197e344d-14d6-49ea-accd-4725a1cb8230/access_as_user` | Exposed by the App Registration to enable the OBO flow. Copilot Studio requests this scope when authenticating the user. |
+| `access_as_user` | `api://<client-id>/access_as_user` | Exposed by the App Registration to enable the OBO flow. Copilot Studio requests this scope when authenticating the user. |
 
 > **Security note**: The server never accesses meetings with its own application identity. Every Graph API call uses a delegated token obtained via OBO, meaning it runs in the context of the signed-in user. If the user doesn't have access to a meeting or transcript, the Graph API will deny the request.
 
@@ -522,63 +753,58 @@ For transcripts to be available, the following must be true:
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `401 Unauthorized` | No bearer token in request | Ensure Copilot Studio is configured with OAuth 2.0 and sends the `Authorization: Bearer <token>` header with every request. |
-| `403 Authentication failed` | OBO token exchange failed | Check that `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and `AZURE_TENANT_ID` environment variables are correct in the Container App. Verify the "Expose an API" scope (`access_as_user`) is configured. |
-| `AADSTS500113: No reply address is registered` | Missing redirect URI | The redirect URI from Copilot Studio is not registered in the App Registration. Go to **Authentication → Web → Redirect URIs** and add the URI shown in the Copilot Studio MCP wizard. Typical URIs needed: `https://global.consent.azure-apim.net/redirect/<connector-id>`, `https://token.botframework.com/.auth/web/redirect`, `https://copilotstudio.microsoft.com/auth/callback`. |
-| `AADSTS65001: The user or administrator has not consented` | Admin consent not granted or incomplete | Go to **App Registration → API permissions** and click **Grant admin consent**. If that button shows consent is already granted, the consent grant may be missing scopes. Verify with: `az rest --method GET --uri "https://graph.microsoft.com/v1.0/servicePrincipals/<sp-id>/oauth2PermissionGrants"` and check the `scope` field includes all three permissions. To fix, PATCH the grant to add the missing scope. |
-| `AADSTS700024: Client assertion contains an invalid signature` | Wrong client secret or tenant | Regenerate the client secret and update the `AZURE_CLIENT_SECRET` env var in the Container App. Double-check `AZURE_TENANT_ID`. |
-| `AADSTS50011: The redirect URI does not match` | Redirect URI mismatch | The redirect URI in the OAuth request must exactly match one registered in the App Registration. Check for trailing slashes and case sensitivity. |
+| `401 Unauthorized` | No bearer token in request | Ensure Copilot Studio is configured with OAuth 2.0 and sends the `Authorization: Bearer <token>` header. |
+| `403 Authentication failed` | OBO token exchange failed | Check `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and `AZURE_TENANT_ID` env vars. Verify the `access_as_user` scope is configured. |
+| `AADSTS500113: No reply address is registered` | Missing redirect URI | Add the redirect URI from the Copilot Studio MCP wizard to **Authentication → Web → Redirect URIs**. |
+| `AADSTS65001: The user or administrator has not consented` | Admin consent not granted/incomplete | Click **Grant admin consent** in API permissions. Verify the grant includes all four scopes (see [below](#verifying-admin-consent-grants)). |
+| `AADSTS700024: Client assertion contains an invalid signature` | Wrong client secret or tenant | Regenerate the client secret and update the env var. |
+| `AADSTS50011: The redirect URI does not match` | Redirect URI mismatch | Check for trailing slashes and case sensitivity. |
+
+### Token Expiry / Session Errors
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `AADSTS500133: Assertion is not within its valid time range` | Copilot Studio cached an expired token | Fully refresh the browser, or disconnect and reconnect the MCP connection. Starting a "New conversation" alone is **not** sufficient. |
+| `403` on cross-tenant meeting resolution | Calendar event is for a meeting in a different Entra ID tenant | Expected behaviour. Server logs these as `[graph] GET failed:` and continues. |
 
 ### Graph API Errors
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `No meetings found` | No Teams meetings in calendar within the date range | Try without a date filter to see all meetings from the last 30 days. The user must be an organiser or invitee of the meeting. |
-| `Transcript not available` | Meeting had no transcription | Transcription must be **started during the meeting** by a participant. Check with your Teams admin that the transcription policy is enabled for the organisation. |
-| `Graph API 403: Forbidden` | Insufficient permissions | Verify that all four scopes (`User.Read`, `Calendars.Read`, `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All`) are in the admin consent grant. |
-| `Graph API 404: Not Found` | Meeting or transcript ID invalid | The meeting may have been deleted or the user may not have access. Try `list_recent_meetings` first to find valid meeting IDs. |
+| `No meetings found` | No Teams meetings in calendar within date range | Try without a date filter (shows last 30 days + 7 days forward). User must be organiser or invitee. |
+| `Transcript not available` | No transcription was started during the meeting | Transcription must be **started during the meeting** by a participant. Check the transcription policy. |
+| `Graph API 403: Forbidden` | Insufficient permissions | Verify all four scopes are in the admin consent grant. |
+| `Graph API 404: Not Found` | Meeting or transcript ID invalid | Meeting may have been deleted. Try `list_recent_meetings` first. |
 
 > **Graph API Gotchas Discovered During Development**:
 >
-> The `/me/onlineMeetings` endpoint has severe limitations that are not immediately obvious from the documentation:
+> The `/me/onlineMeetings` endpoint has severe limitations not obvious from the documentation:
 >
-> 1. **Cannot list all meetings** — the endpoint **requires** `$filter` and only supports filtering by `JoinWebUrl`, `joinMeetingIdSettings/joinMeetingId`, or `VideoTeleconferenceId`. Date-based filters like `startDateTime ge ...` return `400 InvalidArgument`.
->
-> 2. **No `$top` or `$orderby` support** — these OData parameters are rejected with `400` errors.
->
-> 3. **`isOnlineMeeting` not filterable** — the `/me/calendarView` endpoint does not support `$filter=isOnlineMeeting eq true`. You must include `onlineMeeting` in `$select` and filter client-side.
->
-> 4. **DateTimeOffset values must be unquoted** — if you do manage to use a date filter on an endpoint that supports it, the values must not be wrapped in single quotes or you get `400 BadRequest: incompatible types Edm.DateTimeOffset and Edm.String`.
->
-> The solution (used in this project) is to use `/me/calendarView` for meeting discovery, then resolve each meeting's join URL via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` to get the meeting ID needed for transcript access.
-
-### Token Expiry / Copilot Studio Session Errors
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `AADSTS500133: Assertion is not within its valid time range` | Copilot Studio cached an expired user token across conversations | Fully refresh the browser, or disconnect and reconnect the MCP connection in Copilot Studio settings. Starting a "New conversation" is **not** sufficient — the cached token persists. |
-| `403` on cross-tenant meeting resolution | The calendar event is for a meeting organised in a different Entra ID tenant | Expected behaviour. The user cannot resolve `onlineMeeting` objects they do not own. The server logs these as `[graph] GET failed:` with the join URL for diagnosis. |
+> 1. **Cannot list all meetings** — requires `$filter`, only supports `JoinWebUrl`, `joinMeetingIdSettings/joinMeetingId`, or `VideoTeleconferenceId`
+> 2. **No `$top` or `$orderby` support** — rejected with `400`
+> 3. **`isOnlineMeeting` not filterable** — on `/me/calendarView`, you must include `onlineMeeting` in `$select` and filter client-side
+> 4. **DateTimeOffset values must be unquoted** — single quotes cause `400 BadRequest`
 
 ### Container / Deployment Errors
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| Health endpoint times out | Container is cold-starting (min replicas = 0) | Wait ~10 seconds and retry. The container scales from zero to one on first request. To avoid cold starts, set `--min-replicas 1` (increases cost). |
-| Container fails to start | Missing env vars or build error | Check container logs: `az containerapp logs show --resource-group rg-transcripts-mcp --name transcripts-mcp-server --type console --tail 50` |
-| `EACCES: permission denied` | Port conflict in container | Ensure the `PORT` env var matches the `--target-port` in the Container App config (both should be `8080`). |
-| Image pull fails | ACR credentials expired or incorrect | Re-enable admin access: `az acr update --name transcriptsmcpacr --admin-enabled true`. Then update the Container App registry credentials. |
+| Health endpoint times out | Container cold-starting (min replicas = 0) | Wait ~10 seconds and retry. Set `--min-replicas 1` to avoid (increases cost). |
+| Container fails to start | Missing env vars or build error | Check logs: `az containerapp logs show --resource-group <rg> --name <app> --type console --tail 50` |
+| `EACCES: permission denied` | Port conflict | Ensure `PORT` env var matches `--target-port` (both `8080`). |
+| Image pull fails | ACR credentials expired | `az acr update --name <acr> --admin-enabled true`, then update registry credentials. |
 
 ### Copilot Studio Errors
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| "Unable to connect to MCP server" | Server unreachable or wrong URL | Verify the URL ends in `/mcp` (not just the base domain). Check that the Container App has external ingress enabled and the health endpoint responds. |
-| Tools not discovered | MCP handshake fails | Check that the server responds to `initialize` and `tools/list` methods. Test locally first by sending raw JSON-RPC requests. |
-| "Authentication failed" after signing in | OAuth misconfiguration | Ensure all OAuth fields (Client ID, Client Secret, Auth URL, Token URL, Refresh URL, Scope) are correct. The Refresh URL is the same as the Token URL for Entra ID v2.0 endpoints. |
+| "Unable to connect to MCP server" | Wrong URL or server down | Verify URL ends in `/mcp`. Check that `/health` responds. |
+| Tools not discovered | MCP handshake fails | Verify `initialize` and `tools/list` work. Test locally first. |
+| "Authentication failed" after signing in | OAuth misconfiguration | Check all OAuth fields. The Refresh URL is the same as the Token URL for Entra ID v2.0. |
 
 ### Verifying Admin Consent Grants
 
-If you suspect the admin consent grant is incomplete, run:
+If you suspect the admin consent grant is incomplete:
 
 ```bash
 # Get your app's service principal ID
@@ -590,17 +816,15 @@ az rest --method GET \
   --query "value[].scope" -o tsv
 ```
 
-The output should include: `User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All`
+Expected output: `User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All`
 
 To fix a grant with missing scopes:
 
 ```bash
-# Get the grant ID
 GRANT_ID=$(az rest --method GET \
   --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SP_ID/oauth2PermissionGrants" \
   --query "value[0].id" -o tsv)
 
-# Update the grant with all required scopes
 az rest --method PATCH \
   --uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$GRANT_ID" \
   --headers "Content-Type=application/json" \
@@ -609,18 +833,20 @@ az rest --method PATCH \
 
 ---
 
-## Version History
+## Development History
 
-| Version | Tag | Changes |
-|---------|-----|----------|
-| v1–v2 | `v1`, `v2` | Initial implementation using `/me/onlineMeetings` with `$top`, `$orderby`, `$filter` on `startDateTime`. Failed — endpoint rejects all these OData params. |
-| v3 | `v3` | Removed all OData query options from `/me/onlineMeetings` and fetched raw. Failed — endpoint **requires** `$filter`. |
-| v4 | `v4` | Added `$filter=startDateTime ge ...` back. Failed — `startDateTime` is not a supported filter property. |
-| v5 | `v5` | Removed single-quotes around `DateTimeOffset` values in `$filter`. Failed — `startDateTime` filter still not supported on this endpoint. |
-| v6 | `v6` | **Architecture change**: Switched to Calendar API (`/me/calendarView`) for meeting discovery with `$filter=isOnlineMeeting eq true`. Failed — `isOnlineMeeting` does not support filtering. |
-| v7 | `v7` | **Working version**: Removed `$filter` from `calendarView`, added `onlineMeeting` to `$select`, filter client-side for events with a join URL. Resolve each to an `onlineMeeting` ID via `JoinWebUrl eq '...'`. Added `Calendars.Read` permission. |
-| v8 | `v8` | Extended calendarView date range from "30 days back → now" to "30 days back → 7 days forward" to include upcoming/future meetings. |
-| v9 | `v9` | **Current production version**: Added comprehensive `[graph]` logging throughout. Optimised `findMeetingsByName` to filter calendar events by subject name *before* resolving (fewer API calls). Added `graphGetSafe` helper — errors logged instead of silently swallowed. `resolveOnlineMeeting` now tries decoded URL as fallback. Subject preference fixed to always prefer calendar event subject. End-to-end verified via Copilot Studio. |
+This project went through 9 iterations to arrive at a working architecture, primarily due to **undocumented limitations** in the Microsoft Graph `/me/onlineMeetings` API.
+
+| Version | Changes |
+|---------|---------|
+| v1–v2 | Initial implementation using `/me/onlineMeetings` with `$top`, `$orderby`, `$filter` on `startDateTime`. Failed — endpoint rejects all these OData params. |
+| v3 | Removed all OData query options. Failed — endpoint **requires** `$filter`. |
+| v4 | Added `$filter=startDateTime ge ...`. Failed — `startDateTime` is not a supported filter property. |
+| v5 | Removed single-quotes around `DateTimeOffset` values. Failed — `startDateTime` filter still not supported. |
+| v6 | **Architecture change**: Switched to Calendar API (`/me/calendarView`) with `$filter=isOnlineMeeting eq true`. Failed — `isOnlineMeeting` not filterable. |
+| v7 | **First working version**: Removed `$filter` from `calendarView`, added `onlineMeeting` to `$select`, filter client-side, resolve each join URL via `JoinWebUrl eq '...'`. |
+| v8 | Extended date range to "30 days back → 7 days forward" to include upcoming meetings. |
+| v9 | **Current version**: Comprehensive `[graph]` logging. Optimised `findMeetingsByName` to filter by subject *before* resolving. `graphGetSafe` for non-throwing calls. Decoded URL fallback. End-to-end verified with real transcripts via Copilot Studio. |
 
 ---
 
