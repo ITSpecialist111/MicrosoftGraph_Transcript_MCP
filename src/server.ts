@@ -213,7 +213,7 @@ async function handleGetMeetingTranscript(
   const cleanText = cleanVttTranscript(rawVtt);
 
   const header = 'Meeting: ' + meeting.subject + '\nDate: ' + meeting.startDateTime + '\n' +
-    'Meeting link: ' + meeting.joinWebUrl + '\n' +
+    'Transcript URL: ' + transcripts[0].transcriptContentUrl + '\n' +
     'Transcript ID: ' + transcripts[0].id + '\n' +
     'Transcript created: ' + transcripts[0].createdDateTime + '\n' +
     '---\n\n';

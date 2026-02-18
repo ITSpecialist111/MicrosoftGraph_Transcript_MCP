@@ -28,7 +28,7 @@ Hosted on **Azure Container Apps** and designed for integration with **Microsoft
 - [Docker Build & Run](#docker-build--run)
 - [Deploy to Azure Container Apps](#deploy-to-azure-container-apps)
 - [Copilot Studio Integration](#copilot-studio-integration)
-  - [Using the Meeting Link for Downstream Actions](#using-the-meeting-link-for-downstream-actions)
+  - [Using the Transcript URL for Downstream Actions](#using-the-transcript-url-for-downstream-actions)
   - [Agent Instructions](#agent-instructions)
 - [API Reference](#api-reference)
 - [Project Structure](#project-structure)
@@ -715,7 +715,7 @@ Once connected, users can ask the Copilot:
 ```
 Meeting: TredStone - Meetings
 Date: 2026-02-18T19:00:00Z
-Meeting link: https://teams.microsoft.com/l/meetup-join/19%3ameeting_OGY0...
+Transcript URL: https://graph.microsoft.com/v1.0/me/onlineMeetings/...
 Transcript ID: ktVizInGAAAAi_B6lATZRTE5...
 Transcript created: 2026-02-18T06:41:57Z
 ---
@@ -729,21 +729,21 @@ departments...
 
 The agent then analyses the transcript and presents structured insights to the user.
 
-### Using the Meeting Link for Downstream Actions
+### Using the Transcript URL for Downstream Actions
 
-Every transcript response includes a **Meeting link** — the Teams join URL for that meeting. This link points back to the original Teams meeting where the full recording, attendance report, and rich transcript (with timestamps and speaker timeline) are stored.
+Every transcript response includes a **Transcript URL** — a Microsoft Graph API endpoint that points directly to the transcript content. This URL allows downstream systems to programmatically retrieve and reference the original transcript data.
 
 This is important for the [use cases](#use-cases) described earlier:
 
-| Use Case | How the Meeting Link Helps |
-|----------|---------------------------|
-| **Compliance & audit** | The link provides a verifiable reference back to the original meeting record. Auditors can click through to Teams to access the full recording and attendance list. |
-| **Customer service reviews** | Managers can share the meeting link with coaches or reviewers so they can listen to specific sections of the recording alongside the transcript. |
-| **Training & coaching** | The link allows trainers to jump directly into the Teams meeting to replay key moments — the AI-cleaned transcript identifies *what* was said, the recording shows *how* it was said. |
-| **Deal intelligence** | Sales leaders can follow the link to review the full meeting context when the transcript flags an objection or competitor mention. |
-| **Follow-on automation** | Power Automate flows can use the meeting link as a reference URL when creating Planner tasks or CRM entries from action items. |
+| Use Case | How the Transcript URL Helps |
+|----------|-------------------------------|
+| **Compliance & audit** | The URL provides a stable, API-accessible reference to the original transcript. Compliance systems can fetch and archive the transcript content directly. |
+| **Customer service reviews** | QA tools can pull the transcript via the URL for automated analysis, keyword spotting, or coach review dashboards. |
+| **Training & coaching** | Training platforms can ingest transcript content via the URL to build searchable knowledge bases from real meeting discussions. |
+| **Deal intelligence** | CRM integrations can store the transcript URL as a reference, allowing sales leaders to pull the full transcript when reviewing flagged objections or competitor mentions. |
+| **Follow-on automation** | Power Automate flows can use the transcript URL when creating Planner tasks, CRM entries, or RAG pipelines that need access to the source transcript. |
 
-The agent can also hand the meeting link to other MCP tools (e.g., the Office 365 Outlook MCP) to schedule follow-up meetings that reference the original discussion.
+The agent can also pass the transcript URL to other MCP tools or automation workflows that need to retrieve or reference the transcript content.
 
 ### Agent Instructions
 
@@ -780,7 +780,7 @@ Below is a recommended set of agent instructions. Paste this into your Copilot S
 
 #### *Handling Meeting Metadata*
 *When the transcript response includes a header section (before the `---` separator), extract and use:*
-- ***Meeting link**: The Teams join URL — present this when users ask for the meeting link*
+- ***Transcript URL**: The Graph API endpoint for the transcript content — present this when users need to reference or access the transcript*
 - ***Date**: The meeting date/time*
 - ***Transcript ID**: Reference for the specific transcript*
 
@@ -806,7 +806,7 @@ Below is a recommended set of agent instructions. Paste this into your Copilot S
 ```
 ## Meeting Summary: [Subject]
 **Date:** [Date] | **Sentiment:** [Overall sentiment]
-**Meeting link:** [Teams join URL]
+**Transcript URL:** [Graph API transcript content URL]
 
 ### Key Discussion Points
 - [Bullet-point summary of main topics]
