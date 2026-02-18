@@ -95,15 +95,17 @@ Retrieves and cleans the transcript for a specific Teams meeting.
 
 **Returns**: Clean speaker-attributed text with all VTT metadata stripped. The output is ready for AI summarisation and analysis.
 
-**Multi-hop process**:
-1. Queries `/me/calendarView` to find Teams calendar events in the date range
-2. Filters client-side for events with a Teams join URL (`onlineMeeting.joinUrl`)
-3. Resolves each join URL to an `onlineMeeting` ID via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'`
-4. Searches resolved meetings by subject (case-insensitive partial match)
+**Multi-hop process** (optimised in v9):
+1. Queries `/me/calendarView` to find Teams calendar events in the date range (30 days back to 7 days forward by default)
+2. Filters client-side by **subject name first** (case-insensitive partial match) — before any expensive API calls
+3. Filters for events with a Teams join URL (`onlineMeeting.joinUrl`)
+4. Resolves only matching join URLs to an `onlineMeeting` ID via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` (with decoded URL fallback)
 5. Lists transcripts via `/me/onlineMeetings/{id}/transcripts`
 6. Downloads raw VTT from `/me/onlineMeetings/{id}/transcripts/{tid}/content`
 7. Strips WEBVTT headers, timestamps, cue IDs, NOTE blocks, HTML tags
 8. Merges consecutive same-speaker lines into paragraphs
+
+> **Logging**: All Graph API calls are traced to container logs (`[graph]` prefix) for debugging. Failed meeting resolutions are logged with the join URL and error details rather than silently swallowed.
 
 ---
 
@@ -550,6 +552,13 @@ For transcripts to be available, the following must be true:
 >
 > The solution (used in this project) is to use `/me/calendarView` for meeting discovery, then resolve each meeting's join URL via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` to get the meeting ID needed for transcript access.
 
+### Token Expiry / Copilot Studio Session Errors
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `AADSTS500133: Assertion is not within its valid time range` | Copilot Studio cached an expired user token across conversations | Fully refresh the browser, or disconnect and reconnect the MCP connection in Copilot Studio settings. Starting a "New conversation" is **not** sufficient — the cached token persists. |
+| `403` on cross-tenant meeting resolution | The calendar event is for a meeting organised in a different Entra ID tenant | Expected behaviour. The user cannot resolve `onlineMeeting` objects they do not own. The server logs these as `[graph] GET failed:` with the join URL for diagnosis. |
+
 ### Container / Deployment Errors
 
 | Error | Cause | Solution |
@@ -610,6 +619,8 @@ az rest --method PATCH \
 | v5 | `v5` | Removed single-quotes around `DateTimeOffset` values in `$filter`. Failed — `startDateTime` filter still not supported on this endpoint. |
 | v6 | `v6` | **Architecture change**: Switched to Calendar API (`/me/calendarView`) for meeting discovery with `$filter=isOnlineMeeting eq true`. Failed — `isOnlineMeeting` does not support filtering. |
 | v7 | `v7` | **Working version**: Removed `$filter` from `calendarView`, added `onlineMeeting` to `$select`, filter client-side for events with a join URL. Resolve each to an `onlineMeeting` ID via `JoinWebUrl eq '...'`. Added `Calendars.Read` permission. |
+| v8 | `v8` | Extended calendarView date range from "30 days back → now" to "30 days back → 7 days forward" to include upcoming/future meetings. |
+| v9 | `v9` | **Current production version**: Added comprehensive `[graph]` logging throughout. Optimised `findMeetingsByName` to filter calendar events by subject name *before* resolving (fewer API calls). Added `graphGetSafe` helper — errors logged instead of silently swallowed. `resolveOnlineMeeting` now tries decoded URL as fallback. Subject preference fixed to always prefer calendar event subject. End-to-end verified via Copilot Studio. |
 
 ---
 
