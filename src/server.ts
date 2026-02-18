@@ -212,7 +212,11 @@ async function handleGetMeetingTranscript(
   const rawVtt = await getTranscriptContent(graphToken, meeting.id, transcripts[0].id);
   const cleanText = cleanVttTranscript(rawVtt);
 
-  const header = 'Meeting: ' + meeting.subject + '\nDate: ' + meeting.startDateTime + '\n---\n\n';
+  const header = 'Meeting: ' + meeting.subject + '\nDate: ' + meeting.startDateTime + '\n' +
+    'Meeting link: ' + meeting.joinWebUrl + '\n' +
+    'Transcript ID: ' + transcripts[0].id + '\n' +
+    'Transcript created: ' + transcripts[0].createdDateTime + '\n' +
+    '---\n\n';
 
   return { content: [{ type: 'text' as const, text: header + cleanText }] };
 }
