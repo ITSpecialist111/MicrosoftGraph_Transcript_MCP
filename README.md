@@ -1062,7 +1062,9 @@ az rest --method PATCH \
 
 ## Development History
 
-This project went through 13 iterations to arrive at the current architecture, primarily due to **undocumented limitations** in the Microsoft Graph `/me/onlineMeetings` API.
+This entire project — from an empty directory to a fully deployed, production-ready MCP server on Azure Container Apps integrated with Copilot Studio — was built in **approximately 2 hours** using AI-assisted development. This includes all 13 iterations, troubleshooting undocumented Graph API limitations, Azure deployment, admin consent debugging, and the additional features added in v10–v13 (SharePoint save, metadata enrichment, transcript URL refinement, and agent instruction tuning).
+
+The project went through 13 iterations to arrive at the current architecture, primarily due to **undocumented limitations** in the Microsoft Graph `/me/onlineMeetings` API.
 
 | Version | Changes |
 |---------|---------|
