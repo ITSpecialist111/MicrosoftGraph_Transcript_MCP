@@ -226,6 +226,8 @@ Return to Copilot Studio as plain-text speaker-attributed dialogue:
 
   Meeting: Weekly Design Review
   Date: 2026-02-18T15:00:00Z
+  Transcript URL: https://graph.microsoft.com/v1.0/me/onlineMeetings/.../transcripts/.../content
+  Transcript created: 2026-02-18T15:02:31Z
   ---
 
   Alice Smith: We need to finalise the mockups by Friday.
@@ -1060,7 +1062,7 @@ az rest --method PATCH \
 
 ## Development History
 
-This project went through 9 iterations to arrive at a working architecture, primarily due to **undocumented limitations** in the Microsoft Graph `/me/onlineMeetings` API.
+This project went through 13 iterations to arrive at the current architecture, primarily due to **undocumented limitations** in the Microsoft Graph `/me/onlineMeetings` API.
 
 | Version | Changes |
 |---------|---------|
@@ -1071,7 +1073,11 @@ This project went through 9 iterations to arrive at a working architecture, prim
 | v6 | **Architecture change**: Switched to Calendar API (`/me/calendarView`) with `$filter=isOnlineMeeting eq true`. Failed — `isOnlineMeeting` not filterable. |
 | v7 | **First working version**: Removed `$filter` from `calendarView`, added `onlineMeeting` to `$select`, filter client-side, resolve each join URL via `JoinWebUrl eq '...'`. |
 | v8 | Extended date range to "30 days back → 7 days forward" to include upcoming meetings. |
-| v9 | **Current version**: Comprehensive `[graph]` logging. Optimised `findMeetingsByName` to filter by subject *before* resolving. `graphGetSafe` for non-throwing calls. Decoded URL fallback. End-to-end verified with real transcripts via Copilot Studio. |
+| v9 | Comprehensive `[graph]` logging. Optimised `findMeetingsByName` to filter by subject *before* resolving. `graphGetSafe` for non-throwing calls. Decoded URL fallback. End-to-end verified with real transcripts via Copilot Studio. |
+| v10 | Added `save_transcript` tool — retrieves a transcript and uploads it to SharePoint as a Markdown file for RAG indexing. Added `Sites.ReadWrite.All` delegated permission. |
+| v11 | Enriched `get_meeting_transcript` response header with transcript metadata: meeting link, transcript ID, and transcript creation timestamp. |
+| v12 | Changed response header from Teams meeting join URL to **Transcript URL** (Graph API content endpoint) for downstream actions and automation. |
+| v13 | **Current version**: Removed raw Transcript ID from response header (already embedded in the URL). Strengthened agent instructions to always display the Transcript URL and never show base64-encoded IDs. |
 
 ---
 
