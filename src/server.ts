@@ -214,7 +214,6 @@ async function handleGetMeetingTranscript(
 
   const header = 'Meeting: ' + meeting.subject + '\nDate: ' + meeting.startDateTime + '\n' +
     'Transcript URL: ' + transcripts[0].transcriptContentUrl + '\n' +
-    'Transcript ID: ' + transcripts[0].id + '\n' +
     'Transcript created: ' + transcripts[0].createdDateTime + '\n' +
     '---\n\n';
 

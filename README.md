@@ -715,8 +715,7 @@ Once connected, users can ask the Copilot:
 ```
 Meeting: TredStone - Meetings
 Date: 2026-02-18T19:00:00Z
-Transcript URL: https://graph.microsoft.com/v1.0/me/onlineMeetings/...
-Transcript ID: ktVizInGAAAAi_B6lATZRTE5...
+Transcript URL: https://graph.microsoft.com/v1.0/me/onlineMeetings/.../transcripts/.../content
 Transcript created: 2026-02-18T06:41:57Z
 ---
 
@@ -780,11 +779,11 @@ Below is a recommended set of agent instructions. Paste this into your Copilot S
 
 #### *Handling Meeting Metadata*
 *When the transcript response includes a header section (before the `---` separator), extract and use:*
-- ***Transcript URL**: The Graph API endpoint for the transcript content — present this when users need to reference or access the transcript*
+- ***Transcript URL**: The Graph API endpoint for the transcript content — **always display this** as a clickable link labelled "View Transcript" or similar. This is the primary reference for downstream actions.*
 - ***Date**: The meeting date/time*
-- ***Transcript ID**: Reference for the specific transcript*
+- ***Transcript created**: When the transcript was generated*
 
-*Only show the full transcript when the user explicitly asks for it. For questions about meeting details, extract the relevant metadata from the header.*
+*Always include the Transcript URL in your response. Never display raw internal IDs or base64-encoded strings to the user — these are not meaningful. Only show the full transcript text when the user explicitly asks for it.*
 
 #### *What You Capture*
 *When analysing a transcript, extract the following structured information:*
