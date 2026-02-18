@@ -243,6 +243,88 @@ export async function getTranscriptContent(
  * then resolves only the matching events to online meetings (expensive).
  * This avoids calling resolveOnlineMeeting for irrelevant events.
  */
+// ── SharePoint Upload ───────────────────────────────────────────
+
+/**
+ * Resolve a SharePoint site URL (e.g. "contoso.sharepoint.com/sites/Meetings")
+ * to a Graph site ID.
+ */
+export async function resolveSiteId(
+  accessToken: string,
+  siteUrl: string
+): Promise<string> {
+  // Normalise: strip protocol, trailing slashes
+  let cleaned = siteUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+
+  // Extract hostname and server-relative path
+  const firstSlash = cleaned.indexOf('/');
+  let hostname: string;
+  let sitePath: string;
+
+  if (firstSlash === -1) {
+    // Root site, e.g. "contoso.sharepoint.com"
+    hostname = cleaned;
+    sitePath = '';
+  } else {
+    hostname = cleaned.substring(0, firstSlash);
+    sitePath = cleaned.substring(firstSlash); // e.g. "/sites/Meetings"
+  }
+
+  const graphUrl = sitePath
+    ? `${GRAPH_BASE}/sites/${hostname}:${sitePath}`
+    : `${GRAPH_BASE}/sites/${hostname}`;
+
+  console.log(`[graph] Resolving site: ${graphUrl}`);
+  const res = await graphGet(graphUrl, accessToken);
+  const data = (await res.json()) as { id: string };
+  return data.id;
+}
+
+/**
+ * Upload a file to a SharePoint document library folder.
+ *
+ * Uses the PUT /sites/{siteId}/drive/root:/{path}/{filename}:/content endpoint.
+ * This handles files up to 4MB in a single request (transcripts are well under this).
+ *
+ * @returns The webUrl of the uploaded file
+ */
+export async function uploadToSharePoint(
+  accessToken: string,
+  siteId: string,
+  folderPath: string,
+  fileName: string,
+  content: string
+): Promise<string> {
+  // Ensure folder path doesn't start/end with slashes
+  const cleanFolder = folderPath.replace(/^\/+|\/+$/g, '');
+  const encodedPath = cleanFolder
+    ? `${cleanFolder}/${fileName}`
+    : fileName;
+
+  const url = `${GRAPH_BASE}/sites/${siteId}/drive/root:/${encodedPath}:/content`;
+  console.log(`[graph] Uploading to SharePoint: ${encodedPath}`);
+
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'text/plain',
+    },
+    body: content,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`SharePoint upload failed ${res.status}: ${body}`);
+  }
+
+  const data = (await res.json()) as { webUrl: string; name: string; size: number };
+  console.log(`[graph] Upload complete: ${data.name} (${data.size} bytes) → ${data.webUrl}`);
+  return data.webUrl;
+}
+
+// ── Meeting Search ──────────────────────────────────────────────────
+
 export async function findMeetingsByName(
   accessToken: string,
   meetingName: string,

@@ -26,6 +26,8 @@ import {
   listTranscripts,
   getTranscriptContent,
   findMeetingsByName,
+  resolveSiteId,
+  uploadToSharePoint,
 } from './graph';
 import { cleanVttTranscript } from './vtt-parser';
 
@@ -70,6 +72,36 @@ const TOOLS = [
         meetingDate: {
           type: 'string',
           description: 'Date of the meeting in YYYY-MM-DD format. Helps narrow results.',
+        },
+      },
+      required: ['meetingName'],
+    },
+  },
+  {
+    name: 'save_transcript',
+    description:
+      'Retrieve a meeting transcript and save it to a SharePoint document library. ' +
+      'The transcript is cleaned (VTT metadata stripped) and uploaded as a Markdown file ' +
+      'with speaker attribution, ready for RAG indexing, compliance archival, or further processing. ' +
+      'Also returns the transcript text in the response for immediate use.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        meetingName: {
+          type: 'string',
+          description: 'The name (subject) of the meeting to search for. Partial matches are supported.',
+        },
+        meetingDate: {
+          type: 'string',
+          description: 'Date of the meeting in YYYY-MM-DD format. Helps narrow results.',
+        },
+        siteUrl: {
+          type: 'string',
+          description: 'SharePoint site URL (e.g. "contoso.sharepoint.com/sites/Meetings"). If omitted, uses the server default.',
+        },
+        folderPath: {
+          type: 'string',
+          description: 'Folder path within the document library (e.g. "Meeting Transcripts/2026"). If omitted, uses the server default.',
         },
       },
       required: ['meetingName'],
@@ -185,6 +217,105 @@ async function handleGetMeetingTranscript(
   return { content: [{ type: 'text' as const, text: header + cleanText }] };
 }
 
+async function handleSaveTranscript(
+  graphToken: string,
+  args: Record<string, unknown>
+) {
+  const meetingName = args.meetingName as string;
+  const meetingDate = args.meetingDate as string | undefined;
+  const siteUrl = (args.siteUrl as string) || process.env.SHAREPOINT_SITE_URL || '';
+  const folderPath = (args.folderPath as string) || process.env.SHAREPOINT_FOLDER || 'Meeting Transcripts';
+
+  if (!meetingName) {
+    return {
+      content: [{ type: 'text' as const, text: 'meetingName is required.' }],
+      isError: true,
+    };
+  }
+
+  if (!siteUrl) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: 'No SharePoint site URL provided. Either pass siteUrl or set the SHAREPOINT_SITE_URL environment variable.',
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  // 1. Find the meeting
+  const meetings = await findMeetingsByName(graphToken, meetingName, meetingDate);
+  if (meetings.length === 0) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: 'No meeting found matching "' + meetingName + '"' +
+            (meetingDate ? ' on ' + meetingDate : '') +
+            '. Try broadening your search term or checking the date.',
+        },
+      ],
+    };
+  }
+
+  const meeting = meetings[0];
+
+  // 2. Get the transcript
+  const transcripts = await listTranscripts(graphToken, meeting.id);
+  if (transcripts.length === 0) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: 'Meeting "' + meeting.subject + '" was found but has no transcript available.',
+        },
+      ],
+    };
+  }
+
+  const rawVtt = await getTranscriptContent(graphToken, meeting.id, transcripts[0].id);
+  const cleanText = cleanVttTranscript(rawVtt);
+
+  // 3. Build the Markdown file content
+  const meetingDateStr = meeting.startDateTime.split('T')[0];
+  const mdContent =
+    '# ' + meeting.subject + '\n\n' +
+    '**Date:** ' + meeting.startDateTime + '\n\n' +
+    '**Meeting ID:** ' + meeting.id + '\n\n' +
+    '---\n\n' +
+    cleanText;
+
+  // 4. Generate filename: sanitise subject, add date
+  const safeSubject = meeting.subject
+    .replace(/[^a-zA-Z0-9\s-]/g, '')
+    .replace(/\s+/g, '_')
+    .substring(0, 80);
+  const fileName = `${safeSubject}_${meetingDateStr}.md`;
+
+  // 5. Resolve SharePoint site and upload
+  const siteId = await resolveSiteId(graphToken, siteUrl);
+  const webUrl = await uploadToSharePoint(graphToken, siteId, folderPath, fileName, mdContent);
+
+  const header = 'Meeting: ' + meeting.subject + '\nDate: ' + meeting.startDateTime + '\n';
+  const summary =
+    '\n---\n\n' +
+    '**Saved to SharePoint:** ' + webUrl + '\n' +
+    '**File:** ' + fileName + '\n' +
+    '**Folder:** ' + folderPath + '\n\n' +
+    '---\n\n';
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: header + summary + cleanText,
+      },
+    ],
+  };
+}
+
 // -- Express App -------------------------------------------------------------
 
 const app = express();
@@ -240,6 +371,8 @@ app.post('/mcp', async (req: Request, res: Response) => {
             return await handleListRecentMeetings(graphToken, toolArgs);
           case 'get_meeting_transcript':
             return await handleGetMeetingTranscript(graphToken, toolArgs);
+          case 'save_transcript':
+            return await handleSaveTranscript(graphToken, toolArgs);
           default:
             return {
               content: [{ type: 'text' as const, text: 'Unknown tool: ' + name }],

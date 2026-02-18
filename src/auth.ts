@@ -34,12 +34,13 @@ const msalConfig: Configuration = {
 
 const cca = new ConfidentialClientApplication(msalConfig);
 
-// The Graph scopes we need for meeting transcript retrieval
+// The Graph scopes we need for meeting transcript retrieval + SharePoint upload
 const GRAPH_SCOPES = [
   'https://graph.microsoft.com/OnlineMeetings.Read',
   'https://graph.microsoft.com/OnlineMeetingTranscript.Read.All',
   'https://graph.microsoft.com/User.Read',
   'https://graph.microsoft.com/Calendars.Read',
+  'https://graph.microsoft.com/Sites.ReadWrite.All',
 ];
 
 // ── Public API ──────────────────────────────────────────────────────
