@@ -57,7 +57,7 @@ The server returns clean, speaker-attributed text — ready for any LLM to analy
 
 ## Features
 
-- **Two MCP tools**: List meetings with transcript availability, retrieve and clean full transcripts
+- **Three MCP tools**: List meetings, retrieve transcripts, and save transcripts to SharePoint for RAG / archival
 - **Delegated-only permissions**: The server never has its own access — every Graph call runs in the signed-in user's context via OBO
 - **Calendar-based discovery**: Uses `/me/calendarView` to find meetings, then resolves each to an online meeting ID — works around severe `/me/onlineMeetings` API limitations
 - **Optimised name search**: Filters calendar events by subject *before* resolving to online meetings (avoids unnecessary API calls)
@@ -101,7 +101,7 @@ Copilot Studio now supports [**multi-tenant agents**](https://learn.microsoft.co
 │  │                         │  │                          │  │
 │  │ • List meetings         │  │ • list_recent_meetings   │  │
 │  │ • Create events         │  │ • get_meeting_transcript │  │
-│  │ • Send emails           │  │                          │  │
+│  │ • Send emails           │  │ • save_transcript        │  │
 │  │ • Manage calendar       │  │                          │  │
 │  └─────────────────────────┘  └──────────────────────────┘  │
 │                                                             │
@@ -356,6 +356,23 @@ Retrieves and cleans the transcript for a specific Teams meeting.
 
 **Returns**: Clean speaker-attributed text with all VTT metadata stripped. The output is ready for AI summarisation, action item extraction, or semantic search.
 
+### `save_transcript`
+
+Retrieves a meeting transcript and saves it to a SharePoint document library as a Markdown file. The file includes speaker attribution and is formatted for RAG indexing (e.g. by Microsoft 365 Copilot or Azure AI Search). Also returns the transcript text in the response for immediate use.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `meetingName` | string | Yes | Meeting subject to search for (partial match, case-insensitive) |
+| `meetingDate` | string | No | Date filter (YYYY-MM-DD) to narrow results |
+| `siteUrl` | string | No | SharePoint site URL (e.g. `contoso.sharepoint.com/sites/Meetings`). Defaults to `SHAREPOINT_SITE_URL` env var. |
+| `folderPath` | string | No | Folder path in the document library (e.g. `Meeting Transcripts/2026`). Defaults to `SHAREPOINT_FOLDER` env var or `Meeting Transcripts`. |
+
+**Returns**: The cleaned transcript text plus a confirmation with the SharePoint web URL of the uploaded file.
+
+**File naming**: `{Subject}_{YYYY-MM-DD}.md` — e.g. `Design_Review_2026-02-18.md`
+
+> **RAG integration**: Files saved to SharePoint are automatically indexed by **Microsoft 365 Copilot** (no extra setup). For custom RAG, use the [Azure AI Search SharePoint indexer](https://learn.microsoft.com/en-us/azure/search/search-howto-index-sharepoint-online) to pull content into your own search index.
+
 ---
 
 ## Prerequisites
@@ -441,6 +458,7 @@ This is the **critical step** that enables the On-Behalf-Of flow. Without it, th
    | `Calendars.Read` | Read calendar events via `/me/calendarView` to discover Teams meetings |
    | `OnlineMeetings.Read` | Look up online meeting details via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` |
    | `OnlineMeetingTranscript.Read.All` | Read transcript metadata and content |
+   | `Sites.ReadWrite.All` | Upload transcript files to SharePoint (for `save_transcript` tool) |
 
 3. Click **Grant admin consent for [your tenant]**
 
@@ -479,6 +497,8 @@ If Copilot Studio provides a client application ID:
 | `AZURE_CLIENT_SECRET` | Yes | — | Client secret value from App Registration |
 | `AZURE_TENANT_ID` | Yes | — | Directory (tenant) ID |
 | `PORT` | No | `8080` | HTTP server port |
+| `SHAREPOINT_SITE_URL` | No | — | Default SharePoint site for `save_transcript` (e.g. `contoso.sharepoint.com/sites/Meetings`) |
+| `SHAREPOINT_FOLDER` | No | `Meeting Transcripts` | Default folder path in the document library |
 
 ---
 
@@ -798,6 +818,7 @@ TranscriptsMCP/
 | `Calendars.Read` | Delegated | `/me/calendarView` | Discover Teams meetings from the user's calendar |
 | `OnlineMeetings.Read` | Delegated | `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` | Resolve calendar events to online meeting IDs |
 | `OnlineMeetingTranscript.Read.All` | Delegated | `/me/onlineMeetings/{id}/transcripts` | List and download transcript content (VTT) |
+| `Sites.ReadWrite.All` | Delegated | `/sites/{id}/drive/root:/{path}:/content` | Upload transcript files to SharePoint document libraries |
 
 ### Custom Scope
 
