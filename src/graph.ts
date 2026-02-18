@@ -26,6 +26,7 @@ export interface TranscriptInfo {
   id: string;
   meetingId: string;
   createdDateTime: string;
+  transcriptContentUrl: string;
 }
 
 interface CalendarEvent {
@@ -216,10 +217,11 @@ export async function listTranscripts(
 ): Promise<TranscriptInfo[]> {
   const url = `${GRAPH_BASE}/me/onlineMeetings/${meetingId}/transcripts`;
   const res = await graphGet(url, accessToken);
-  const data = await res.json() as { value: TranscriptInfo[] };
+  const data = await res.json() as { value: Array<TranscriptInfo & { contentUrl?: string }> };
   return (data.value || []).map((t) => ({
     ...t,
     meetingId,
+    transcriptContentUrl: t.contentUrl || `${GRAPH_BASE}/me/onlineMeetings/${meetingId}/transcripts/${t.id}/content`,
   }));
 }
 
