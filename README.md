@@ -462,7 +462,7 @@ This is the **critical step** that enables the On-Behalf-Of flow. Without it, th
 
 3. Click **Grant admin consent for [your tenant]**
 
-> **Important**: After granting admin consent, verify the consent grant includes **all four scopes**. If the grant was created before all permissions were added, you may need to update it. See [Troubleshooting → Verifying Admin Consent Grants](#verifying-admin-consent-grants).
+> **Important**: After granting admin consent, verify the consent grant includes **all five scopes**. If the grant was created before all permissions were added, you may need to update it. See [Troubleshooting → Verifying Admin Consent Grants](#verifying-admin-consent-grants).
 
 ### 5. Configure Authentication (Redirect URIs)
 
@@ -846,7 +846,7 @@ For transcripts to be available, the following must be true:
 | `401 Unauthorized` | No bearer token in request | Ensure Copilot Studio is configured with OAuth 2.0 and sends the `Authorization: Bearer <token>` header. |
 | `403 Authentication failed` | OBO token exchange failed | Check `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and `AZURE_TENANT_ID` env vars. Verify the `access_as_user` scope is configured. |
 | `AADSTS500113: No reply address is registered` | Missing redirect URI | Add the redirect URI from the Copilot Studio MCP wizard to **Authentication → Web → Redirect URIs**. |
-| `AADSTS65001: The user or administrator has not consented` | Admin consent not granted/incomplete | Click **Grant admin consent** in API permissions. Verify the grant includes all four scopes (see [below](#verifying-admin-consent-grants)). |
+| `AADSTS65001: The user or administrator has not consented` | Admin consent not granted/incomplete | Click **Grant admin consent** in API permissions. Verify the grant includes all five scopes (see [below](#verifying-admin-consent-grants)). **Common pitfall**: If you added permissions *after* the initial consent grant, the grant is NOT automatically updated — you must re-grant or patch it. |
 | `AADSTS700024: Client assertion contains an invalid signature` | Wrong client secret or tenant | Regenerate the client secret and update the env var. |
 | `AADSTS50011: The redirect URI does not match` | Redirect URI mismatch | Check for trailing slashes and case sensitivity. |
 
@@ -863,7 +863,7 @@ For transcripts to be available, the following must be true:
 |-------|-------|----------|
 | `No meetings found` | No Teams meetings in calendar within date range | Try without a date filter (shows last 30 days + 7 days forward). User must be organiser or invitee. |
 | `Transcript not available` | No transcription was started during the meeting | Transcription must be **started during the meeting** by a participant. Check the transcription policy. |
-| `Graph API 403: Forbidden` | Insufficient permissions | Verify all four scopes are in the admin consent grant. |
+| `Graph API 403: Forbidden` | Insufficient permissions | Verify all five scopes are in the admin consent grant (see [Verifying Admin Consent Grants](#verifying-admin-consent-grants)). |
 | `Graph API 404: Not Found` | Meeting or transcript ID invalid | Meeting may have been deleted. Try `list_recent_meetings` first. |
 
 > **Graph API Gotchas Discovered During Development**:
@@ -906,11 +906,22 @@ az rest --method GET \
   --query "value[].scope" -o tsv
 ```
 
-Expected output: `User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All`
+Expected output: `User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All Sites.ReadWrite.All`
 
 To fix a grant with missing scopes:
 
 ```bash
+# Option 1: Using az ad app permission grant (simplest)
+# Get the service principal object ID first
+SP_OBJECT_ID=$(az ad sp show --id <client-id> --query id -o tsv)
+
+# Re-grant with ALL required scopes (this replaces the existing grant)
+az ad app permission grant \
+  --id $SP_OBJECT_ID \
+  --api 00000003-0000-0000-c000-000000000000 \
+  --scope "User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All Sites.ReadWrite.All"
+
+# Option 2: Using az rest to PATCH the existing grant
 GRANT_ID=$(az rest --method GET \
   --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SP_ID/oauth2PermissionGrants" \
   --query "value[0].id" -o tsv)
@@ -918,8 +929,10 @@ GRANT_ID=$(az rest --method GET \
 az rest --method PATCH \
   --uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$GRANT_ID" \
   --headers "Content-Type=application/json" \
-  --body '{"scope":"User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All"}'
+  --body '{"scope":"User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All Sites.ReadWrite.All"}'
 ```
+
+> **Why does this happen?** When you click "Grant admin consent" in the Azure Portal, it creates or updates an `oauth2PermissionGrant` object. However, if permissions were added to the App Registration *after* the initial grant was created, the portal may not update the existing grant to include the new scopes. The OBO flow then fails with `AADSTS65001` because the grant doesn't cover all the scopes the server is requesting. The fix is to explicitly re-grant with all scopes using the CLI commands above.
 
 ---
 
