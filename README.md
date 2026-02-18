@@ -8,7 +8,9 @@ Hosted on **Azure Container Apps** and designed for integration with **Microsoft
 
 ## Table of Contents
 
+- [Use Cases](#use-cases)
 - [Features](#features)
+- [Combining with Other MCP Servers](#combining-with-other-mcp-servers)
 - [Architecture](#architecture)
 - [How It Works — Internals](#how-it-works--internals)
   - [End-to-End Pipeline](#end-to-end-pipeline)
@@ -35,6 +37,24 @@ Hosted on **Azure Container Apps** and designed for integration with **Microsoft
 
 ---
 
+## Use Cases
+
+Once an AI agent can access the full text of a meeting, the transcript becomes a launchpad for downstream automation:
+
+| Use Case | Description |
+|----------|-------------|
+| **Sentiment analysis** | Gauge how a customer call *actually* went — detect frustration, satisfaction, or escalation patterns across every interaction, not just the ones a manager happened to attend. |
+| **Follow-on automation** | Extract action items, decisions, and deadlines, then push them into Power Automate flows — create Planner tasks, send follow-up emails, or update CRM records automatically. |
+| **Customer service reviews** | Audit support calls at scale without replaying hours of recordings. Search across transcripts for specific topics, complaints, or compliance language. |
+| **Deal intelligence** | Surface objections, competitor mentions, pricing commitments, and next steps from sales calls — feed them into your pipeline reporting. |
+| **Training & coaching** | Identify coaching moments by analysing how reps handle objections, discovery questions, or product demos. Compare top performers against the team. |
+| **Compliance & audit** | Verify that required disclosures, disclaimers, or consent language were delivered during regulated conversations. |
+| **Meeting summaries on demand** | Let users ask an agent *"What did we decide in the design review?"* and get a structured answer — without anyone having to write meeting notes. |
+
+The server returns clean, speaker-attributed text — ready for any LLM to analyse, summarise, or act on.
+
+---
+
 ## Features
 
 - **Two MCP tools**: List meetings with transcript availability, retrieve and clean full transcripts
@@ -45,6 +65,55 @@ Hosted on **Azure Container Apps** and designed for integration with **Microsoft
 - **Comprehensive logging**: All Graph API calls are traced with `[graph]` prefixes for debugging
 - **Stateless container**: Scales to zero when idle, ~250ms cold start on Alpine Node.js 20
 - **Built for Copilot Studio**: Drop-in MCP server with OAuth 2.0 wizard support
+
+---
+
+## Combining with Other MCP Servers
+
+MCP is designed to be composable — a single Copilot Studio agent can connect to **multiple MCP servers** simultaneously, each providing different tools. This Transcripts MCP server becomes significantly more powerful when paired with other Microsoft 365 MCP servers.
+
+### With the Office 365 Outlook / Meeting Management MCP
+
+Copilot Studio includes a built-in **Office 365 Outlook MCP connector** (Meeting Management MCP Server) that provides tools for listing, creating, and managing calendar events. When both servers are connected to the same agent:
+
+| Agent capability | How it works |
+|-----------------|---------------|
+| *"What meetings do I have today?"* | The **Outlook MCP** lists today's calendar events (including non-Teams meetings). |
+| *"Get the transcript from the Design Review"* | The **Transcripts MCP** finds the meeting and returns the cleaned transcript. |
+| *"Summarise my Monday standup and create follow-up tasks"* | The agent chains both servers — retrieves the transcript, then uses the Outlook MCP to schedule follow-up meetings or send recap emails. |
+
+The LLM in Copilot Studio automatically decides which MCP server's tools to call based on the user's prompt. No manual routing is needed — the agent sees all available tools from all connected servers and plans accordingly.
+
+### Multi-Tenant Agents (Preview)
+
+Copilot Studio now supports [**multi-tenant agents**](https://learn.microsoft.com/en-us/microsoft-copilot-studio/multi-tenant-overview) as a preview feature, allowing you to deploy a single agent across multiple Entra ID tenants. Combined with a remote MCP server like this one (hosted on Azure Container Apps with OBO auth), you can offer transcript-powered AI agents as a managed service to multiple organisations — each user authenticates with their own tenant and only sees their own meetings.
+
+### Example: Multi-Server Agent Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Copilot Studio Agent                      │
+│                                                             │
+│  Connected MCP Servers:                                     │
+│  ┌─────────────────────────┐  ┌──────────────────────────┐  │
+│  │ Office 365 Outlook MCP  │  │ Transcripts MCP Server   │  │
+│  │ (Built-in connector)    │  │ (This repo)              │  │
+│  │                         │  │                          │  │
+│  │ • List meetings         │  │ • list_recent_meetings   │  │
+│  │ • Create events         │  │ • get_meeting_transcript │  │
+│  │ • Send emails           │  │                          │  │
+│  │ • Manage calendar       │  │                          │  │
+│  └─────────────────────────┘  └──────────────────────────┘  │
+│                                                             │
+│  User: "What did we agree in the TredStone meeting?         │
+│         Schedule a follow-up for next Tuesday."             │
+│                                                             │
+│  Agent plan:                                                │
+│   1. get_meeting_transcript("TredStone") → Transcripts MCP  │
+│   2. Summarise action items from transcript                 │
+│   3. Create calendar event → Outlook MCP                    │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
