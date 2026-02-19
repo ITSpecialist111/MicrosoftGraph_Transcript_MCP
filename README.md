@@ -1079,3 +1079,8 @@ This project went through 9 iterations to arrive at a working architecture, prim
 ## License
 
 MIT
+
+## Disclaimer
+
+**Authentication & Liability**: This project is an open-source bridge and is not an official Microsoft product. It uses your own Azure AD App Registration and operates under the context of the signed-in user. You are responsible for managing the security of your client secrets and tokens. The maintainers of this repository accept no liability for any data loss, security breaches, or unexpected charges incurred by using this software. Use at your own risk.
+
