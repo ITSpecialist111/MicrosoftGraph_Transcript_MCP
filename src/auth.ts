@@ -38,6 +38,9 @@ const cca = new ConfidentialClientApplication(msalConfig);
 const GRAPH_SCOPES = [
   'https://graph.microsoft.com/OnlineMeetings.Read',
   'https://graph.microsoft.com/OnlineMeetingTranscript.Read.All',
+  'https://graph.microsoft.com/OnlineMeetingRecording.Read.All',
+  'https://graph.microsoft.com/CallTranscripts.Read.All',
+  'https://graph.microsoft.com/CallRecordings.Read.All',
   'https://graph.microsoft.com/User.Read',
   'https://graph.microsoft.com/Calendars.Read',
   'https://graph.microsoft.com/Sites.ReadWrite.All',

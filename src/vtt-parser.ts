@@ -13,6 +13,18 @@
  *  - HTML tags (<v>, <c>, etc.)
  */
 
+// ── Types ───────────────────────────────────────────────────────────
+
+export interface MetadataUtterance {
+  startDateTime: string;
+  endDateTime: string;
+  speakerName: string;
+  spokenText: string;
+  spokenLanguage: string;
+}
+
+// ── VTT Cleaning ────────────────────────────────────────────────────
+
 /**
  * Clean raw VTT transcript content into plain speaker dialogue.
  */
@@ -126,4 +138,87 @@ function mergeSpeakerLines(lines: string[]): string {
   }
 
   return merged.join('\n');
+}
+
+// ── Metadata Content Parsing ────────────────────────────────────────
+
+/**
+ * Parse the metadataContent stream from Graph API.
+ *
+ * The metadataContent is a VTT-formatted file where each cue body is a JSON
+ * object with structured utterance data:
+ *   {"startDateTime":"...","endDateTime":"...","speakerName":"...","spokenText":"...","spokenLanguage":"en-us"}
+ *
+ * Returns parsed utterance objects.
+ */
+export function parseMetadataContent(raw: string): MetadataUtterance[] {
+  const utterances: MetadataUtterance[] = [];
+  const lines = raw.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || /^WEBVTT/i.test(trimmed)) continue;
+    // Skip timing lines
+    if (/^\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}/.test(trimmed)) continue;
+
+    // Try to parse as JSON utterance
+    if (trimmed.startsWith('{')) {
+      try {
+        const obj = JSON.parse(trimmed) as MetadataUtterance;
+        if (obj.spokenText && obj.speakerName) {
+          utterances.push(obj);
+        }
+      } catch {
+        // Not valid JSON — skip
+      }
+    }
+  }
+
+  return utterances;
+}
+
+/**
+ * Format metadata utterances into timestamped speaker-attributed text.
+ *
+ * Output format:
+ *   [2026-02-17T10:00:30Z] Alice: Hello everyone
+ *   [2026-02-17T10:00:35Z] Bob: Hi Alice
+ */
+export function formatMetadataAsTimestamped(utterances: MetadataUtterance[]): string {
+  if (utterances.length === 0) return '';
+
+  const merged: string[] = [];
+  let currentSpeaker = '';
+  let currentText = '';
+  let currentTime = '';
+
+  for (const u of utterances) {
+    if (u.speakerName === currentSpeaker) {
+      currentText += ' ' + u.spokenText;
+    } else {
+      if (currentSpeaker) {
+        merged.push(`[${currentTime}] ${currentSpeaker}: ${currentText}`);
+      }
+      currentSpeaker = u.speakerName;
+      currentText = u.spokenText;
+      currentTime = u.startDateTime;
+    }
+  }
+
+  if (currentSpeaker) {
+    merged.push(`[${currentTime}] ${currentSpeaker}: ${currentText}`);
+  }
+
+  return merged.join('\n');
+}
+
+/**
+ * Format metadata utterances into plain speaker-attributed text (no timestamps).
+ * Uses the structured metadata for cleaner parsing than VTT tag stripping.
+ */
+export function formatMetadataAsPlain(utterances: MetadataUtterance[]): string {
+  if (utterances.length === 0) return '';
+
+  const lines = utterances.map((u) => `${u.speakerName}: ${u.spokenText}`);
+  return mergeSpeakerLines(lines);
 }
