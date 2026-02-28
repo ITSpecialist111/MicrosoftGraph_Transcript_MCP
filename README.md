@@ -1,8 +1,4 @@
-# Transcripts MCP Server
 
-A remote **Model Context Protocol (MCP)** server that retrieves Microsoft Teams meeting transcripts via the Microsoft Graph API, using delegated **OAuth 2.0 On-Behalf-Of (OBO)** authentication.
-
-Hosted on **Azure Container Apps** and designed for integration with **Microsoft Copilot Studio** (via the MCP Wizard), though any MCP-compatible client can connect.
 
 ---
 
@@ -52,6 +48,9 @@ Once an AI agent can access the full text of a meeting, the transcript becomes a
 | **Training & coaching** | Identify coaching moments by analysing how reps handle objections, discovery questions, or product demos. Compare top performers against the team. |
 | **Compliance & audit** | Verify that required disclosures, disclaimers, or consent language were delivered during regulated conversations. |
 | **Meeting summaries on demand** | Let users ask an agent *"What did we decide in the design review?"* and get a structured answer — without anyone having to write meeting notes. |
+| **Recording retrieval** | Surface recording download URLs so users can access the meeting .mp4 without navigating the Teams UI — useful for archival and media workflows. |
+| **AI-powered insights** | Leverage Microsoft 365 Copilot to get pre-structured meeting notes, action items with owners, and mention events — no transcript analysis needed, the AI has already done it. |
+| **Ad hoc call analysis** | Extend transcript analysis to unscheduled calls (PSTN, 1:1, group) — capture and process conversations that never appear on a calendar. |
 
 The server returns clean, speaker-attributed text — ready for any LLM to analyse, summarise, or act on.
 
@@ -59,7 +58,7 @@ The server returns clean, speaker-attributed text — ready for any LLM to analy
 
 ## Features
 
-- **Three MCP tools**: List meetings, retrieve transcripts, and save transcripts to SharePoint for RAG / archival
+- **Six MCP tools**: List meetings, retrieve transcripts (with optional timestamps), get recordings, get AI insights (Copilot), get ad hoc call transcripts, and save transcripts to SharePoint
 - **Delegated-only permissions**: The server never has its own access — every Graph call runs in the signed-in user's context via OBO
 - **Calendar-based discovery**: Uses `/me/calendarView` to find meetings, then resolves each to an online meeting ID — works around severe `/me/onlineMeetings` API limitations
 - **Optimised name search**: Filters calendar events by subject *before* resolving to online meetings (avoids unnecessary API calls)
@@ -323,6 +322,10 @@ Entra ID issues delegated Graph token with scopes:
   - Calendars.Read
   - OnlineMeetings.Read
   - OnlineMeetingTranscript.Read.All
+  - OnlineMeetingRecording.Read.All
+  - CallTranscripts.Read.All
+  - CallRecordings.Read.All
+  - Sites.ReadWrite.All
   │
   ▼
 graph.ts uses delegated token for all API calls → runs as the signed-in user
@@ -347,7 +350,7 @@ Lists recent Microsoft Teams online meetings for the signed-in user.
 | `date` | string | No | Filter meetings to this date (YYYY-MM-DD) |
 | `limit` | number | No | Maximum results to return (default: 10, max: 50) |
 
-**Returns**: Meeting subject, start/end times, meeting ID, and whether a transcript is available.
+**Returns**: Meeting subject, start/end times, meeting ID, and whether a transcript and recording are available.
 
 ### `get_meeting_transcript`
 
@@ -357,8 +360,42 @@ Retrieves and cleans the transcript for a specific Teams meeting.
 |-----------|------|----------|-------------|
 | `meetingName` | string | Yes | Meeting subject to search for (partial match, case-insensitive) |
 | `meetingDate` | string | No | Date filter (YYYY-MM-DD) to narrow results |
+| `includeTimestamps` | boolean | No | If true, returns per-utterance ISO timestamps and spoken language detection (uses metadata content). Default: false |
 
-**Returns**: Clean speaker-attributed text with all VTT metadata stripped. The output is ready for AI summarisation, action item extraction, or semantic search.
+**Returns**: Clean speaker-attributed text with all VTT metadata stripped. When `includeTimestamps` is true, output includes `[ISO datetime]` prefixes and language tags per utterance. The output is ready for AI summarisation, action item extraction, or semantic search.
+
+### `get_meeting_recording`
+
+Retrieves recording metadata for a specific Teams meeting.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `meetingName` | string | Yes | Meeting subject to search for (partial match, case-insensitive) |
+| `meetingDate` | string | No | Date filter (YYYY-MM-DD) to narrow results |
+
+**Returns**: Recording ID, creation and end timestamps, a content URL for downloading the .mp4 file, and a `contentCorrelationId` that links the recording to its corresponding transcript.
+
+### `get_meeting_insights`
+
+Retrieves AI-generated meeting insights powered by Microsoft 365 Copilot.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `meetingName` | string | Yes | Meeting subject to search for (partial match, case-insensitive) |
+| `meetingDate` | string | No | Date filter (YYYY-MM-DD) to narrow results |
+
+**Returns**: Structured meeting notes (summaries with subpoints), action items with assigned owners, and participant mention events. Requires the signed-in user to have a **Microsoft 365 Copilot licence**. Insights are typically available within 4 hours after the meeting ends.
+
+### `get_adhoc_transcript`
+
+Retrieves the transcript for an ad hoc call (PSTN, 1:1, or group call).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `callId` | string | Yes | The unique identifier for the ad hoc call |
+| `includeTimestamps` | boolean | No | If true, returns per-utterance ISO timestamps. Default: false |
+
+**Returns**: Clean speaker-attributed text. Unlike scheduled meetings, ad hoc calls are **not discoverable via calendar** — the call ID must be provided directly.
 
 ### `save_transcript`
 
@@ -368,12 +405,14 @@ Retrieves a meeting transcript and saves it to a SharePoint document library as 
 |-----------|------|----------|-------------|
 | `meetingName` | string | Yes | Meeting subject to search for (partial match, case-insensitive) |
 | `meetingDate` | string | No | Date filter (YYYY-MM-DD) to narrow results |
-| `siteUrl` | string | No | SharePoint site URL (e.g. `contoso.sharepoint.com/sites/Meetings`). Defaults to `SHAREPOINT_SITE_URL` env var. |
-| `folderPath` | string | No | Folder path in the document library (e.g. `Meeting Transcripts/2026`). Defaults to `SHAREPOINT_FOLDER` env var or `Meeting Transcripts`. |
+| `siteUrl` | string | **Yes** | SharePoint site URL (e.g. `contoso.sharepoint.com/sites/Meetings`). Must be provided by the agent instructions or the user's request — there is no server-side default. |
+| `folderPath` | string | No | Folder path in the document library (e.g. `Meeting Transcripts/2026`). Defaults to `Meeting Transcripts`. |
 
 **Returns**: The cleaned transcript text plus a confirmation with the SharePoint web URL of the uploaded file.
 
 **File naming**: `{Subject}_{YYYY-MM-DD}.md` — e.g. `Design_Review_2026-02-18.md`
+
+> **Design note**: The `siteUrl` is intentionally **not** configured via environment variable. This keeps the server stateless and reusable — different agents (or the same agent with different instructions) can target different SharePoint sites without redeploying the server. The agent instructions should specify which SharePoint site to use. See [Agent Instructions](#agent-instructions) for an example.
 
 > **RAG integration**: Files saved to SharePoint are automatically indexed by **Microsoft 365 Copilot** (no extra setup). For custom RAG, use the [Azure AI Search SharePoint indexer](https://learn.microsoft.com/en-us/azure/search/search-howto-index-sharepoint-online) to pull content into your own search index.
 
@@ -462,11 +501,14 @@ This is the **critical step** that enables the On-Behalf-Of flow. Without it, th
    | `Calendars.Read` | Read calendar events via `/me/calendarView` to discover Teams meetings |
    | `OnlineMeetings.Read` | Look up online meeting details via `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` |
    | `OnlineMeetingTranscript.Read.All` | Read transcript metadata and content |
+   | `OnlineMeetingRecording.Read.All` | List recordings and retrieve content URLs |
+   | `CallTranscripts.Read.All` | Read transcripts for ad hoc calls (PSTN, 1:1, group) |
+   | `CallRecordings.Read.All` | Read recordings for ad hoc calls |
    | `Sites.ReadWrite.All` | Upload transcript files to SharePoint (for `save_transcript` tool) |
 
 3. Click **Grant admin consent for [your tenant]**
 
-> **Important**: After granting admin consent, verify the consent grant includes **all five scopes**. If the grant was created before all permissions were added, you may need to update it. See [Troubleshooting → Verifying Admin Consent Grants](#verifying-admin-consent-grants).
+> **Important**: After granting admin consent, verify the consent grant includes **all eight scopes**. If the grant was created before all permissions were added, you may need to update it. See [Troubleshooting → Verifying Admin Consent Grants](#verifying-admin-consent-grants).
 
 ### 5. Configure Authentication (Redirect URIs)
 
@@ -501,8 +543,8 @@ If Copilot Studio provides a client application ID:
 | `AZURE_CLIENT_SECRET` | Yes | — | Client secret value from App Registration |
 | `AZURE_TENANT_ID` | Yes | — | Directory (tenant) ID |
 | `PORT` | No | `8080` | HTTP server port |
-| `SHAREPOINT_SITE_URL` | No | — | Default SharePoint site for `save_transcript` (e.g. `contoso.sharepoint.com/sites/Meetings`) |
-| `SHAREPOINT_FOLDER` | No | `Meeting Transcripts` | Default folder path in the document library |
+
+> **Note**: SharePoint configuration (`siteUrl` and `folderPath`) is passed at call time by the agent instructions — not via environment variables. This allows the same server deployment to save transcripts to different SharePoint sites depending on the agent or user request. See [Agent Instructions](#agent-instructions) for examples.
 
 ---
 
@@ -769,10 +811,13 @@ Below is a recommended set of agent instructions. Paste this into your Copilot S
 ***Step 1 — Find the meeting***
 *Use the Meeting Management MCP (Office 365 Outlook) tool `list_meetings` or similar calendar tools to find the meeting the user is asking about. This returns the meeting subject, date/time, and attendees.*
 
-***Step 2 — Get the transcript***
+***Step 2 — Get meeting data***
 *Use the Transcripts MCP Server tools:*
-- *`list_recent_meetings` — to browse recent Teams meetings and check transcript availability*
-- *`get_meeting_transcript` — to retrieve the full cleaned transcript by meeting name (and optionally date). Pass the meeting subject from Step 1 as the `meetingName` parameter.*
+- *`list_recent_meetings` — to browse recent Teams meetings and check transcript and recording availability*
+- *`get_meeting_transcript` — to retrieve the full cleaned transcript by meeting name (and optionally date). Pass the meeting subject from Step 1 as the `meetingName` parameter. Set `includeTimestamps` to true if the user needs per-utterance timestamps or language detection.*
+- *`get_meeting_recording` — to get recording metadata and download URLs for a meeting*
+- *`get_meeting_insights` — to get AI-generated meeting notes, action items, and mention events (requires the user to have a Microsoft 365 Copilot licence)*
+- *`get_adhoc_transcript` — to get the transcript for an ad hoc call (PSTN, 1:1, or group call). The user must provide the call ID directly as ad hoc calls are not on the calendar.*
 
 ***Step 3 — Analyse and respond***
 *Once you have the transcript text, analyse it to answer the user's question or produce the structured output described below.*
@@ -798,8 +843,13 @@ Below is a recommended set of agent instructions. Paste this into your Copilot S
 - ***Risks & Concerns**: Any risks, blockers, or concerns raised by participants*
 - ***Next Best Actions**: Recommended follow-up actions based on the meeting content*
 
-#### *Saving Transcripts*
-*If the user asks to save or archive a transcript to SharePoint, use the `save_transcript` tool from the Transcripts MCP Server. You can specify a SharePoint site and folder path, or use the server defaults.*
+#### *Saving Transcripts to SharePoint*
+#### *SharePoint Configuration*
+*When saving transcripts to SharePoint, always use the following site and folder:*
+- *SharePoint site: `contoso.sharepoint.com/sites/Meetings`*
+- *Folder path: `Meeting Transcripts/2026`*
+
+*If the user specifies a different SharePoint site or folder, use their values instead. The `siteUrl` parameter is required — always pass it to the `save_transcript` tool.*
 
 #### *Response Format*
 *When summarising a meeting, use this structure:*
@@ -941,7 +991,10 @@ TranscriptsMCP/
 | `User.Read` | Delegated | `/me` | Required for sign-in; enables all `/me` endpoints |
 | `Calendars.Read` | Delegated | `/me/calendarView` | Discover Teams meetings from the user's calendar |
 | `OnlineMeetings.Read` | Delegated | `/me/onlineMeetings?$filter=JoinWebUrl eq '...'` | Resolve calendar events to online meeting IDs |
-| `OnlineMeetingTranscript.Read.All` | Delegated | `/me/onlineMeetings/{id}/transcripts` | List and download transcript content (VTT) |
+| `OnlineMeetingTranscript.Read.All` | Delegated | `/me/onlineMeetings/{id}/transcripts` | List and download transcript content (VTT and metadata) |
+| `OnlineMeetingRecording.Read.All` | Delegated | `/me/onlineMeetings/{id}/recordings` | List recordings and retrieve recording content URLs |
+| `CallTranscripts.Read.All` | Delegated | `/me/adhocCalls/{id}/transcripts` | List and download transcripts for ad hoc calls (PSTN, 1:1, group) |
+| `CallRecordings.Read.All` | Delegated | `/me/adhocCalls/{id}/recordings` | List recordings for ad hoc calls |
 | `Sites.ReadWrite.All` | Delegated | `/sites/{id}/drive/root:/{path}:/content` | Upload transcript files to SharePoint document libraries |
 
 ### Custom Scope
@@ -970,7 +1023,7 @@ For transcripts to be available, the following must be true:
 | `401 Unauthorized` | No bearer token in request | Ensure Copilot Studio is configured with OAuth 2.0 and sends the `Authorization: Bearer <token>` header. |
 | `403 Authentication failed` | OBO token exchange failed | Check `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and `AZURE_TENANT_ID` env vars. Verify the `access_as_user` scope is configured. |
 | `AADSTS500113: No reply address is registered` | Missing redirect URI | Add the redirect URI from the Copilot Studio MCP wizard to **Authentication → Web → Redirect URIs**. |
-| `AADSTS65001: The user or administrator has not consented` | Admin consent not granted/incomplete | Click **Grant admin consent** in API permissions. Verify the grant includes all five scopes (see [below](#verifying-admin-consent-grants)). **Common pitfall**: If you added permissions *after* the initial consent grant, the grant is NOT automatically updated — you must re-grant or patch it. |
+| `AADSTS65001: The user or administrator has not consented` | Admin consent not granted/incomplete | Click **Grant admin consent** in API permissions. Verify the grant includes all eight scopes (see [below](#verifying-admin-consent-grants)). **Common pitfall**: If you added permissions *after* the initial consent grant, the grant is NOT automatically updated — you must re-grant or patch it. |
 | `AADSTS700024: Client assertion contains an invalid signature` | Wrong client secret or tenant | Regenerate the client secret and update the env var. |
 | `AADSTS50011: The redirect URI does not match` | Redirect URI mismatch | Check for trailing slashes and case sensitivity. |
 
@@ -987,7 +1040,7 @@ For transcripts to be available, the following must be true:
 |-------|-------|----------|
 | `No meetings found` | No Teams meetings in calendar within date range | Try without a date filter (shows last 30 days + 7 days forward). User must be organiser or invitee. |
 | `Transcript not available` | No transcription was started during the meeting | Transcription must be **started during the meeting** by a participant. Check the transcription policy. |
-| `Graph API 403: Forbidden` | Insufficient permissions | Verify all five scopes are in the admin consent grant (see [Verifying Admin Consent Grants](#verifying-admin-consent-grants)). |
+| `Graph API 403: Forbidden` | Insufficient permissions | Verify all eight scopes are in the admin consent grant (see [Verifying Admin Consent Grants](#verifying-admin-consent-grants)). |
 | `Graph API 404: Not Found` | Meeting or transcript ID invalid | Meeting may have been deleted. Try `list_recent_meetings` first. |
 
 > **Graph API Gotchas Discovered During Development**:
@@ -1030,7 +1083,7 @@ az rest --method GET \
   --query "value[].scope" -o tsv
 ```
 
-Expected output: `User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All Sites.ReadWrite.All`
+Expected output: `User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All OnlineMeetingRecording.Read.All CallTranscripts.Read.All CallRecordings.Read.All Sites.ReadWrite.All`
 
 To fix a grant with missing scopes:
 
@@ -1043,7 +1096,7 @@ SP_OBJECT_ID=$(az ad sp show --id <client-id> --query id -o tsv)
 az ad app permission grant \
   --id $SP_OBJECT_ID \
   --api 00000003-0000-0000-c000-000000000000 \
-  --scope "User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All Sites.ReadWrite.All"
+  --scope "User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All OnlineMeetingRecording.Read.All CallTranscripts.Read.All CallRecordings.Read.All Sites.ReadWrite.All"
 
 # Option 2: Using az rest to PATCH the existing grant
 GRANT_ID=$(az rest --method GET \
@@ -1053,7 +1106,7 @@ GRANT_ID=$(az rest --method GET \
 az rest --method PATCH \
   --uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$GRANT_ID" \
   --headers "Content-Type=application/json" \
-  --body '{"scope":"User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All Sites.ReadWrite.All"}'
+  --body '{"scope":"User.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All OnlineMeetingRecording.Read.All CallTranscripts.Read.All CallRecordings.Read.All Sites.ReadWrite.All"}'
 ```
 
 > **Why does this happen?** When you click "Grant admin consent" in the Azure Portal, it creates or updates an `oauth2PermissionGrant` object. However, if permissions were added to the App Registration *after* the initial grant was created, the portal may not update the existing grant to include the new scopes. The OBO flow then fails with `AADSTS65001` because the grant doesn't cover all the scopes the server is requesting. The fix is to explicitly re-grant with all scopes using the CLI commands above.
@@ -1079,7 +1132,23 @@ The project went through 13 iterations to arrive at the current architecture, pr
 | v10 | Added `save_transcript` tool — retrieves a transcript and uploads it to SharePoint as a Markdown file for RAG indexing. Added `Sites.ReadWrite.All` delegated permission. |
 | v11 | Enriched `get_meeting_transcript` response header with transcript metadata: meeting link, transcript ID, and transcript creation timestamp. |
 | v12 | Changed response header from Teams meeting join URL to **Transcript URL** (Graph API content endpoint) for downstream actions and automation. |
-| v13 | **Current version**: Removed raw Transcript ID from response header (already embedded in the URL). Strengthened agent instructions to always display the Transcript URL and never show base64-encoded IDs. |
+| v13 | Removed raw Transcript ID from response header (already embedded in the URL). Strengthened agent instructions to always display the Transcript URL and never show base64-encoded IDs. |
+| v14 | Added 3 new tools (`get_meeting_recording`, `get_meeting_insights`, `get_adhoc_transcript`). Enhanced `get_meeting_transcript` with `includeTimestamps` parameter for per-utterance ISO timestamps and language detection via metadata content API. `list_recent_meetings` now shows recording availability. Added `parseMetadataContent` and timestamped formatting in vtt-parser. Added scopes for recordings and ad hoc calls. |
+| v15 | Made `siteUrl` a required parameter on `save_transcript` — the SharePoint site is now driven by agent instructions rather than a server-side environment variable. Removed `SHAREPOINT_SITE_URL` and `SHAREPOINT_FOLDER` env vars. This allows the same server deployment to target different SharePoint sites per agent or per user request. |
+| v16 | **Current version**: Live deployment testing and App Registration fixes. Pre-authorised Azure CLI as a known client app for terminal-based testing. Fixed an invalid permission ID for `OnlineMeetingTranscript.Read.All` — the original GUID (`30b87d18...28b0`) was not a valid Graph permission; replaced with the correct ID (`30b87d18...190c`). Added 3 missing permissions to the App Registration (`OnlineMeetingRecording.Read.All`, `CallTranscripts.Read.All`, `CallRecordings.Read.All`). Patched the admin consent grant via Graph API to include all 8 scopes. Full end-to-end testing of all 6 tools against live data: `list_recent_meetings` (6 meetings found), `get_meeting_transcript` (plain and timestamped), `get_meeting_recording` (recording retrieved for Project Alpha), `get_meeting_insights` (graceful handling — requires Copilot licence), `save_transcript` (successfully saved to SharePoint). |
+
+---
+
+## Roadmap
+
+Planned enhancements for future versions:
+
+| Priority | Feature | Description |
+|----------|---------|-------------|
+| P1 | **Change Notifications (webhooks)** | Subscribe to Graph webhook notifications for new transcripts and recordings via `POST /subscriptions`. Enables real-time processing instead of polling — ideal for compliance pipelines and auto-archival to SharePoint. |
+| | | **Docs**: [Use the Microsoft Graph API to get change notifications](https://learn.microsoft.com/en-us/graph/api/resources/webhooks) · [Create subscription](https://learn.microsoft.com/en-us/graph/api/subscription-post-subscriptions) · [Change notifications for online meetings](https://learn.microsoft.com/en-us/graph/changenotifications-for-onlinemeeting) |
+| P2 | **Delta Queries** | Use `GET /me/onlineMeetings/delta` to efficiently detect only meetings that have changed since the last sync. Reduces API calls dramatically for periodic sync scenarios. |
+| | | **Docs**: [Use delta query to track changes in Microsoft Graph data](https://learn.microsoft.com/en-us/graph/delta-query-overview) · [onlineMeeting: delta](https://learn.microsoft.com/en-us/graph/api/onlinemeeting-delta) |
 
 ---
 

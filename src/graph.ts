@@ -29,6 +29,42 @@ export interface TranscriptInfo {
   transcriptContentUrl: string;
 }
 
+export interface RecordingInfo {
+  id: string;
+  meetingId: string;
+  createdDateTime: string;
+  endDateTime: string;
+  recordingContentUrl: string;
+  contentCorrelationId: string;
+}
+
+export interface AiInsightSummary {
+  id: string;
+  callId: string;
+  contentCorrelationId: string;
+  createdDateTime: string;
+  endDateTime: string;
+  meetingNotes: Array<{
+    title: string;
+    text: string;
+    subpoints?: Array<{ title: string; text: string }>;
+  }>;
+  actionItems: Array<{
+    title: string;
+    text: string;
+    ownerDisplayName: string;
+  }>;
+  viewpoint?: {
+    mentionEvents: Array<{
+      eventDateTime: string;
+      transcriptUtterance: string;
+      speaker: {
+        user?: { id: string; displayName: string };
+      };
+    }>;
+  };
+}
+
 interface CalendarEvent {
   subject: string;
   start: { dateTime: string; timeZone: string };
@@ -239,6 +275,140 @@ export async function getTranscriptContent(
 }
 
 /**
+ * Download the metadata content of a transcript (structured JSON-line format).
+ * Returns per-utterance data with timestamps, speaker names, and spoken language.
+ */
+export async function getTranscriptMetadataContent(
+  accessToken: string,
+  meetingId: string,
+  transcriptId: string
+): Promise<string> {
+  const url = `${GRAPH_BASE}/me/onlineMeetings/${meetingId}/transcripts/${transcriptId}/metadataContent`;
+  console.log('[graph] Fetching transcript metadataContent');
+  const res = await graphGet(url, accessToken, 'text/vtt');
+  return res.text();
+}
+
+// ── Recordings ──────────────────────────────────────────────────────
+
+/**
+ * List recordings available for a specific online meeting.
+ */
+export async function listRecordings(
+  accessToken: string,
+  meetingId: string
+): Promise<RecordingInfo[]> {
+  const url = `${GRAPH_BASE}/me/onlineMeetings/${meetingId}/recordings`;
+  console.log('[graph] Listing recordings for meeting:', meetingId);
+  const res = await graphGet(url, accessToken);
+  const data = await res.json() as { value: Array<RecordingInfo & { contentUrl?: string }> };
+  return (data.value || []).map((r) => ({
+    ...r,
+    meetingId,
+    recordingContentUrl: r.contentUrl || `${GRAPH_BASE}/me/onlineMeetings/${meetingId}/recordings/${r.id}/content`,
+  }));
+}
+
+/**
+ * Get the download URL for a meeting recording.
+ * Returns the recordingContentUrl that can be used to stream/download the .mp4.
+ */
+export async function getRecordingContentUrl(
+  accessToken: string,
+  meetingId: string,
+  recordingId: string
+): Promise<string> {
+  return `${GRAPH_BASE}/me/onlineMeetings/${meetingId}/recordings/${recordingId}/content`;
+}
+
+// ── AI Insights (Copilot) ───────────────────────────────────────────
+
+/**
+ * Get the current user's ID via /me.
+ */
+export async function getCurrentUserId(accessToken: string): Promise<string> {
+  const url = `${GRAPH_BASE}/me?$select=id`;
+  const res = await graphGet(url, accessToken);
+  const data = (await res.json()) as { id: string };
+  return data.id;
+}
+
+/**
+ * Fetch AI-generated meeting insights (summaries, action items, mentions).
+ * Requires the user to have a Microsoft 365 Copilot license.
+ *
+ * Uses: GET /copilot/users/{userId}/onlineMeetings/{meetingId}/aiInsights
+ */
+export async function getMeetingAiInsights(
+  accessToken: string,
+  userId: string,
+  meetingId: string
+): Promise<AiInsightSummary | null> {
+  const listUrl = `${GRAPH_BASE}/copilot/users/${userId}/onlineMeetings/${meetingId}/aiInsights`;
+  console.log('[graph] Fetching AI insights for meeting:', meetingId);
+
+  const listData = await graphGetSafe<{ value: Array<{ id: string }> }>(listUrl, accessToken);
+  if (!listData?.value?.length) {
+    console.log('[graph] No AI insights available for this meeting');
+    return null;
+  }
+
+  // Fetch the detailed insight for the first (most recent) insight object
+  const insightId = listData.value[0].id;
+  const detailUrl = `${GRAPH_BASE}/copilot/users/${userId}/onlineMeetings/${meetingId}/aiInsights/${insightId}`;
+  const detail = await graphGetSafe<AiInsightSummary>(detailUrl, accessToken);
+  return detail;
+}
+
+// ── Ad Hoc Call Transcripts ─────────────────────────────────────────
+
+/**
+ * List transcripts available for an ad hoc call (PSTN, 1:1, group calls).
+ */
+export async function listAdhocCallTranscripts(
+  accessToken: string,
+  callId: string
+): Promise<TranscriptInfo[]> {
+  const url = `${GRAPH_BASE}/me/adhocCalls/${callId}/transcripts`;
+  console.log('[graph] Listing ad hoc call transcripts for call:', callId);
+  const res = await graphGet(url, accessToken);
+  const data = await res.json() as { value: Array<TranscriptInfo & { contentUrl?: string }> };
+  return (data.value || []).map((t) => ({
+    ...t,
+    meetingId: callId,
+    transcriptContentUrl: t.contentUrl || `${GRAPH_BASE}/me/adhocCalls/${callId}/transcripts/${t.id}/content`,
+  }));
+}
+
+/**
+ * Download the raw VTT content of an ad hoc call transcript.
+ */
+export async function getAdhocTranscriptContent(
+  accessToken: string,
+  callId: string,
+  transcriptId: string
+): Promise<string> {
+  const url = `${GRAPH_BASE}/me/adhocCalls/${callId}/transcripts/${transcriptId}/content?$format=text/vtt`;
+  console.log('[graph] Downloading ad hoc call transcript content');
+  const res = await graphGet(url, accessToken, 'text/vtt');
+  return res.text();
+}
+
+/**
+ * Download the metadata content of an ad hoc call transcript.
+ */
+export async function getAdhocTranscriptMetadataContent(
+  accessToken: string,
+  callId: string,
+  transcriptId: string
+): Promise<string> {
+  const url = `${GRAPH_BASE}/me/adhocCalls/${callId}/transcripts/${transcriptId}/metadataContent`;
+  console.log('[graph] Fetching ad hoc call transcript metadataContent');
+  const res = await graphGet(url, accessToken, 'text/vtt');
+  return res.text();
+}
+
+/**
  * Find meetings whose subject matches a search term (case-insensitive).
  *
  * Optimised flow: fetches calendar events, filters by name FIRST (cheap),
@@ -313,6 +483,7 @@ export async function uploadToSharePoint(
       'Content-Type': 'text/plain',
     },
     body: content,
+    // text/markdown is more accurate for .md files but text/plain works universally
   });
 
   if (!res.ok) {
